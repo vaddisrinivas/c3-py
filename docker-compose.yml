@@ -1,0 +1,15 @@
+services:
+  c3:
+    build: .
+    image: c3-py:latest
+    container_name: c3
+    stdin_open: true
+    tty: true
+    volumes:
+      - plugin:/plugin
+      - claude-auth:/home/c3/.claude
+    restart: unless-stopped
+
+volumes:
+  plugin:
+  claude-auth:

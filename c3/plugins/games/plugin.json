@@ -1,0 +1,14 @@
+{
+  "name": "games",
+  "description": "Multiplayer WhatsApp games — trivia, mafia, werewolf, and more",
+  "access": {
+    "commands": {
+      "/start":  ["hosts", "admins"],
+      "/stop":   ["hosts", "admins"],
+      "/status": ["hosts", "admins"],
+      "/plugin": ["hosts", "admins"]
+    },
+    "dm":    ["hosts", "admins", "session_participants"],
+    "group": ["session_group"]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "calendar",
+  "description": "user wants to schedule something, add an event, set a reminder, or block time on their calendar",
+  "access": {
+    "commands": {
+      "/start":  ["hosts", "admins"],
+      "/stop":   ["hosts", "admins"],
+      "/status": ["hosts", "admins"],
+      "/plugin": ["hosts", "admins"]
+    },
+    "dm":    ["hosts", "admins"],
+    "group": ["hosts", "admins"]
+  }
+}

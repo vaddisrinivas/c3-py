@@ -1,0 +1,116 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "c3-py"
+version = "0.1.0"
+description = "WhatsApp × Claude Code — run AI-hosted multiplayer games over WhatsApp via MCP"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "c3-py contributors" }]
+keywords = ["whatsapp", "mcp", "claude", "games", "ai", "baileys"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Games/Entertainment",
+    "Typing :: Typed",
+]
+dependencies = [
+    "mcp>=1.1.0",
+    "anyio>=4.0.0",
+    "uvicorn>=0.30.0",
+    "starlette>=0.40.0",
+    "dataset>=1.6.0",
+    "typer>=0.12.0",
+    "apscheduler>=3.10.0",
+    "watchfiles>=0.21.0",
+    "pydantic-settings>=2.3.0",
+    "pydantic>=2.0.0",
+]
+
+[project.urls]
+Homepage    = "https://github.com/vaddisrinivas/c3-py"
+Repository  = "https://github.com/vaddisrinivas/c3-py"
+Issues      = "https://github.com/vaddisrinivas/c3-py/issues"
+Changelog   = "https://github.com/vaddisrinivas/c3-py/blob/main/CHANGELOG.md"
+
+[project.scripts]
+c3-py = "c3.agent:cli"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.12",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[tool.hatch.build.targets.sdist]
+include = ["c3/**", "README.md", "LICENSE"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["c3"]
+include = ["c3/**"]
+
+# ─── Pytest ───────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths    = ["tests"]
+
+# ─── Ruff ─────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length    = 100
+target-version = "py311"
+src            = ["c3", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "UP",       # pyupgrade
+    "B",        # flake8-bugbear
+    "C4",       # flake8-comprehensions
+    "SIM",      # flake8-simplify
+    "TID",      # flake8-tidy-imports
+    "RUF",      # ruff-specific
+]
+ignore = [
+    "E501",   # line length — handled by formatter
+    "E701",   # multiple statements on one line (colon) — intentional compact style
+    "E702",   # multiple statements on one line (semicolon) — intentional in tests
+    "B008",   # function-call in default arg
+    "SIM108", # ternary — sometimes less readable
+    "RUF002", # ambiguous unicode in docstrings (× is intentional)
+    "RUF015", # next(iter()) preference — list()[0] is clearer in tests
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["c3"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ─── Mypy ─────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version         = "3.11"
+strict                 = false
+warn_unused_ignores    = true
+warn_return_any        = true
+warn_unused_configs    = true
+ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]

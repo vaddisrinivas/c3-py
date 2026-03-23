@@ -1,0 +1,10 @@
+{
+  "player": {
+    "fields": ["name", "score", "wins", "losses", "favorite_topic", "last_seen"],
+    "example": {"plugin": "games", "entity": "player", "name": "Srini", "score": 15, "wins": 3, "losses": 1, "favorite_topic": "Movies", "last_seen": "2026-03-22"}
+  },
+  "game_session": {
+    "fields": ["date", "game", "topic", "winner", "participants", "rounds", "duration_mins"],
+    "example": {"plugin": "games", "entity": "game_session", "date": "2026-03-22", "game": "trivia", "topic": "Movies", "winner": "Srini", "participants": ["Srini", "Raj"], "rounds": 10}
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "c3-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node.js dependencies for baileys_bridge.js",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
