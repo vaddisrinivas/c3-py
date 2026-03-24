@@ -6,8 +6,8 @@ services:
     stdin_open: true
     tty: true
     volumes:
-      - c3-data:/data
-      - claude-auth:/home/c3/.claude
+      - ./data:/data
+      - ./claude-auth:/home/c3/.claude
     environment:
       - C3_DATA_DIR=/data
     healthcheck:
@@ -16,7 +16,3 @@ services:
       timeout: 5s
       retries: 3
     restart: unless-stopped
-
-volumes:
-  c3-data:
-  claude-auth:

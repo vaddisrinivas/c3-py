@@ -68,7 +68,8 @@ memory.db
 # Ruff
 .ruff_cache/
 
-# Docker volumes / Claude Code local state
+# Runtime data (sessions, memory, installed apps, credentials)
+data/
 claude-auth/
 .claude/
 
