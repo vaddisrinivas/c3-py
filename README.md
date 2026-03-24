@@ -29,7 +29,7 @@ A framework with three layers:
 | Layer | What it does | You touch it? |
 |---|---|---|
 | **Core** | RBAC, session management, MCP (Model Context Protocol) server, bridge lifecycle | No |
-| **Apps** | Markdown prompts + JSON config that define behavior | Yes — this is where you build |
+| **Apps** | Markdown + JSON, not code — define what your app does and who can use it | Yes — this is where you build |
 | **WhatsApp** | Baileys (WhatsApp Web library) bridge, message types, polls, media, reactions | No |
 
 You write **apps**. The core runs them. WhatsApp is the transport.
@@ -82,7 +82,7 @@ You do X via WhatsApp.
 
 ### Create an app
 
-DM the bot: "make me an app for expense tracking". The **appgen** app walks you through it with polls — access model, tools, memory, crons — then generates and saves the files.
+DM your bot: "make me an app for expense tracking" — **appgen** walks you through it with WhatsApp polls, generates the files, done.
 
 Or scaffold manually: `c3-py app new expense-tracker`
 
@@ -253,7 +253,7 @@ Rebuild to update: `docker compose up -d --build`
 
 ```bash
 uv sync --all-extras
-uv run pytest         # 361 tests
+uv run pytest         # 374 tests
 uvx ruff check c3/
 ```
 
