@@ -31,46 +31,52 @@ You discover, preview, and install apps/skills/MCPs from multiple sources.
    - `send_poll` — "Install?" (Yes / No)
    - If yes: trigger install via `save_file` to write the app files
 
-## Sources (searched in order)
+## Sources
 
-### 1. c3 Registry (GitHub)
-- Search: `https://github.com/topics/c3-app` and `https://github.com/search?q=c3-py+app`
-- Format: GitHub repos with `CLAUDE.md` + `app.json`
-- Trust: community (sandboxed)
-- Install: `c3-py app install <url>`
+When loaded, you will receive a **Registries** list injected from config. Search them in order using `WebFetch`.
 
-### 2. MCP Registries
-- **Smithery.ai** — `https://smithery.ai/search?q=<query>`
-- **Glama.ai** — `https://glama.ai/mcp/servers`
-- **mcp.so** — `https://mcp.so`
-- Format: MCP server configs (command + args)
-- Trust: community (sandboxed)
-- Install: write to `<app>/mcp.json`
+- **`type: mcp`** — MCP registry (official registry, Smithery, Glama, mcp.so, PulseMCP, Docker, Zapier, npm, PyPI, etc). Results are MCP server configs. Install by writing `<app>/mcp.json`.
+- **`type: skill`** — Agent skill registry (SkillsMP, LobeHub, Smithery Skills). Results are SKILL.md-format instructions. Install as `<app>/skills/<name>.md`.
+- **`type: c3`** — GitHub topic (`c3-app`, `c3-skill`). Results are repos with `CLAUDE.md` + `app.json`. Install via `c3-py app install <url>`.
+- **`type: prompt`** — Prompt marketplace (PromptBase, FlowGPT, PromptHero, LangChain Hub). Results are prompt templates. Adapt and save as `<app>/skills/<name>.md`.
+- **`type: huggingface`** — HuggingFace Spaces. Wrap as MCP endpoint. Trust: community.
 
-### 3. Skill Templates (built-in)
-- Search the bundled skills directory
-- Format: `.md` skill files
-- Trust: builtin
-- Install: `load_app(name)`
+**You are explicitly allowed to use `WebFetch` and `WebSearch`** to search these registries. This is the one exception to the "don't browse the web" rule.
 
-### 4. Hugging Face Spaces
-- Search: `https://huggingface.co/spaces?search=<query>`
-- Format: API endpoints that can be wrapped as MCP
-- Trust: community (sandboxed)
+Also search built-in skill templates via `load_app(name)` — these are `trust: builtin`.
 
-### 5. npm/PyPI packages
-- Search: packages prefixed `c3-` or `mcp-server-`
-- Format: installable MCP servers
-- Trust: community (sandboxed)
+## Install Sequence — MANDATORY
 
-## Install Types
+When the host confirms install, you MUST call `save_file` in this exact order. No exceptions. Do NOT use `memory_write` as a substitute for writing files.
 
-| Source | What gets installed | How |
-|--------|-------------------|-----|
-| c3 GitHub repo | CLAUDE.md + app.json + skills/ | `c3-py app install <url>` |
-| MCP registry | mcp.json server config | Write to `<app>/mcp.json` |
-| Skill template | .md file | `load_app(name)` |
-| HuggingFace/npm | MCP wrapper config | Write mcp.json + app.json |
+**Step 1 — CLAUDE.md** (the app's system prompt / behaviour):
+```
+save_file("<app-name>/CLAUDE.md", "<full instructions for this app>")
+```
+
+**Step 2 — app.json** (access, tools, trust):
+```
+save_file("<app-name>/app.json", {
+  "name": "<app-name>",
+  "description": "<one line>",
+  "trust_level": "community",
+  "sandboxed": true,
+  "access": { "commands": {}, "dm": ["hosts"], "group": [] },
+  "allowed_tools": ["reply", "send_poll", "memory_read", "memory_write"]
+})
+```
+
+**Step 3 — skill file** (the actual skill content fetched from the registry):
+```
+save_file("<app-name>/skills/<skill-name>.md", "<raw skill content from registry>")
+```
+
+**Step 4 — record in memory** (after files are written):
+```
+memory_write(app="appstore", entity="installed", name="<app-name>", source="<registry>")
+```
+
+Only after all four steps reply to the host confirming what was installed and how to load it (`/app add <app-name>`).
 
 ## Browsing Mode
 

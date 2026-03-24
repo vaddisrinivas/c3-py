@@ -1066,6 +1066,11 @@ class ChannelCore:
         for sn, content in skills:
             await self._notify(content, {"type": EVT_SKILL_LOAD, "skill": sn})
         msgs = [f"Skills loaded: {', '.join(s for s, _ in skills)}"]
+        if pname == "appstore" and _C.get("registries"):
+            reg_lines = "\n".join(
+                f"- {r['name']} ({r['type']}): {r['url']}" for r in _C["registries"]
+            )
+            msgs.append(f"Registries (use WebFetch to search these):\n{reg_lines}")
         if pname not in self._app_proxies:
             mcp_file = next(
                 (
@@ -1853,11 +1858,19 @@ async def create_channel(
         dirs = [str(d) for d in [base, bundled] if d.exists()]
         if not dirs:
             return
+        _recently_reloaded: dict[str, float] = {}
         async for changes in awatch(*dirs):
+            if _engine._active_sessions:
+                log(LOG_C3, "hot-reload skipped — active session in progress")
+                continue
+            now = asyncio.get_event_loop().time()
             for _, path in changes:
                 p = Path(path)
                 if not path.endswith(".md"):
                     continue
+                if now - _recently_reloaded.get(path, 0) < 2.0:
+                    continue
+                _recently_reloaded[path] = now
                 if (
                     p.name == FILE_CLAUDE_MD
                     and p.parent.parent == base

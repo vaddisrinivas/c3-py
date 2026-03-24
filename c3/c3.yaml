@@ -203,6 +203,94 @@ messages:
   error_memory_denied: "Error: memory access denied — app '{app}' not in allowed_resources"
   denied_dm: "denied: host blocked DM to {token}"
 
+# ── App registries (searched by appstore in order) ───────────────────────────
+registries:
+  # Official MCP registries
+  - name: MCP Registry (official)
+    url: "https://registry.modelcontextprotocol.io/v0/servers?search={query}"
+    type: mcp
+  - name: Smithery
+    url: "https://smithery.ai/?q={query}"
+    type: mcp
+  - name: Glama
+    url: "https://glama.ai/mcp/servers?query={query}"
+    type: mcp
+  - name: mcp.so
+    url: "https://mcp.so/"
+    type: mcp
+  - name: PulseMCP
+    url: "https://www.pulsemcp.com/servers"
+    type: mcp
+  - name: MCP Server Finder
+    url: "https://www.mcpserverfinder.com/search"
+    type: mcp
+  - name: MCPServers.com
+    url: "https://mcpservers.com/"
+    type: mcp
+  - name: Awesome MCP Servers
+    url: "https://github.com/punkpeye/awesome-mcp-servers"
+    type: mcp
+  - name: Docker MCP Catalog
+    url: "https://hub.docker.com/mcp"
+    type: mcp
+  - name: Zapier MCP
+    url: "https://zapier.com/mcp"
+    type: mcp
+
+  # Package registries
+  - name: npm (MCP packages)
+    url: "https://www.npmjs.com/search?q=mcp-server-+{query}"
+    type: mcp
+  - name: PyPI (MCP packages)
+    url: "https://pypi.org/search/?q=mcp-server+{query}"
+    type: mcp
+
+  # Skill registries (SKILL.md / agent skills)
+  - name: SkillsMP
+    url: "https://skillsmp.com/"
+    type: skill
+  - name: LobeHub Skills
+    url: "https://lobehub.com/skills"
+    type: skill
+  - name: Smithery Skills
+    url: "https://smithery.ai/skills"
+    type: skill
+
+  # c3 app/skill registries (GitHub topics)
+  - name: c3 Apps
+    url: "https://github.com/topics/c3-app"
+    type: c3
+  - name: c3 Skills
+    url: "https://github.com/topics/c3-skill"
+    type: c3
+
+  # Prompt marketplaces
+  - name: PromptBase
+    url: "https://promptbase.com/search?q={query}"
+    type: prompt
+  - name: FlowGPT
+    url: "https://flowgpt.com/search?q={query}"
+    type: prompt
+  - name: PromptHero
+    url: "https://prompthero.com/search?q={query}"
+    type: prompt
+  - name: LangChain Hub
+    url: "https://smith.langchain.com/hub"
+    type: prompt
+
+  # Agent skill ecosystems (SKILL.md format)
+  - name: skills.sh
+    url: "https://skills.sh/"
+    type: skill
+  - name: agentskill.sh
+    url: "https://agentskill.sh/"
+    type: skill
+
+  # Model / API registries
+  - name: HuggingFace Spaces
+    url: "https://huggingface.co/spaces?search={query}"
+    type: huggingface
+
 # ── Prerequisites check ─────────────────────────────────────────────────────
 prereqs:
   checks:
