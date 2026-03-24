@@ -68,8 +68,9 @@ memory.db
 # Ruff
 .ruff_cache/
 
-# Docker volumes
+# Docker volumes / Claude Code local state
 claude-auth/
+.claude/
 
 # Stray files from terminal escape codes
 xterm.js*
