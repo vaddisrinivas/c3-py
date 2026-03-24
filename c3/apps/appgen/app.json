@@ -1,0 +1,19 @@
+{
+  "$schema": "../app.schema.json",
+  "name": "appgen",
+  "description": "Generate new c3 apps via WhatsApp conversation with the host",
+  "trust_level": "builtin",
+  "sandboxed": false,
+  "access": {
+    "commands": {
+      "/start": ["hosts"],
+      "/stop": ["hosts"],
+      "/app": ["hosts"]
+    },
+    "dm": ["hosts"],
+    "group": []
+  },
+  "memory_schema": {},
+  "crons": [],
+  "allowed_tools": ["reply", "send_poll", "save_file", "memory_read", "memory_write"]
+}

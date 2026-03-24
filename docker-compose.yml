@@ -6,10 +6,17 @@ services:
     stdin_open: true
     tty: true
     volumes:
-      - plugin:/plugin
+      - c3-data:/data
       - claude-auth:/home/c3/.claude
+    environment:
+      - C3_DATA_DIR=/data
+    healthcheck:
+      test: ["CMD", "test", "-f", "/data/sessions/creds.json"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
 
 volumes:
-  plugin:
+  c3-data:
   claude-auth:

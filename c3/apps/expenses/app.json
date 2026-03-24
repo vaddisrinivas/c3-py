@@ -1,0 +1,14 @@
+{
+  "name": "expenses",
+  "description": "Track shared expenses and split bills in group chats",
+  "trust_level": "builtin",
+  "access": {
+    "commands": {},
+    "dm": ["hosts"],
+    "group": ["session_participants"]
+  },
+  "memory_schema": {
+    "expense": { "fields": ["amount", "paid_by", "split_among", "date", "category"] },
+    "balance": { "fields": ["person", "owes_to", "amount"] }
+  }
+}

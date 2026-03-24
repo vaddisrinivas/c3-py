@@ -1,0 +1,359 @@
+# c3-py configuration — single source of truth
+# Override any value with C3_ env vars (e.g. C3_PORT=8080)
+
+# ── Server ────────────────────────────────────────────────────────────────────
+server:
+  host: "0.0.0.0"
+  port: 3000
+  model: claude-haiku-4-5
+
+# ── Timeouts (seconds) ───────────────────────────────────────────────────────
+timeouts:
+  bridge_connect: 120
+  baileys_cmd: 30
+  app_init: 10
+  test_message: 20
+  phase_expiry_grace: 3
+  approval: 120
+  fetch: 30
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+defaults:
+  duration: 600              # default session duration
+  phase_timer: 60            # default phase timer
+  log_truncate: 200          # max chars in log lines
+  notify_queue_size: 500     # max pending notifications
+  dm_preview_length: 100     # chars shown in approval preview
+  catchup_text_length: 120   # chars per catchup message
+  log_text_length: 80        # chars in on_message log
+  node_min_version: 18       # minimum Node.js major version
+  creds_min_size: 10         # bytes — below this, creds.json is empty
+
+# ── Config field mapping (name → [section, key]) ─────────────────────────────
+config_fields:
+  host: [server, host]
+  port: [server, port]
+  bridge_connect_timeout: [timeouts, bridge_connect]
+  baileys_cmd_timeout: [timeouts, baileys_cmd]
+  app_init_timeout: [timeouts, app_init]
+  test_message_timeout: [timeouts, test_message]
+  phase_expiry_grace: [timeouts, phase_expiry_grace]
+  default_duration: [defaults, duration]
+  default_phase_timer: [defaults, phase_timer]
+  log_truncate: [defaults, log_truncate]
+  approval_timeout: [timeouts, approval]
+  fetch_timeout: [timeouts, fetch]
+  notify_queue_size: [defaults, notify_queue_size]
+  dm_preview_length: [defaults, dm_preview_length]
+  catchup_text_length: [defaults, catchup_text_length]
+  log_text_length: [defaults, log_text_length]
+  node_min_version: [defaults, node_min_version]
+  creds_min_size: [defaults, creds_min_size]
+
+# ── MIME types ───────────────────────────────────────────────────────────────
+mime_types:
+  jpg: image/jpeg
+  jpeg: image/jpeg
+  png: image/png
+  gif: image/gif
+  mp4: video/mp4
+  ogg: audio/ogg
+  mp3: audio/mpeg
+  webp: image/webp
+  pdf: application/pdf
+
+# ── Default manifest (RBAC) ─────────────────────────────────────────────────
+manifest:
+  name: c3
+  access:
+    commands:
+      /start: [hosts]
+      /stop: [hosts]
+      /status: [hosts]
+      /catchup: [hosts]
+      /clear: [hosts]
+      /app: [hosts]
+      /agent: [hosts]
+    dm: [hosts]
+    group: []
+
+# ── Safe app template (for auto-generated app.json) ─────────────────────────
+safe_app:
+  $schema: "../app.schema.json"
+  trust_level: community
+  sandboxed: true
+  access:
+    commands:
+      /start: [hosts]
+    dm: [hosts]
+    group: []
+  allowed_tools: [reply, send_poll, memory_read, memory_write]
+
+# ── Scaffold templates ───────────────────────────────────────────────────────
+scaffold:
+  CLAUDE.md: "## {name}\n\nDescribe what this app does and what capabilities it adds.\n"
+  "skills/{name}.md": "## {name} skill\n\nInstructions for Claude when this skill is active.\n"
+
+# ── MCP resource templates ───────────────────────────────────────────────────
+resource_templates:
+  - name: memory-by-app
+    uriTemplate: "c3://memory/{app}"
+    description: Memory entities for a specific app
+    mimeType: application/json
+  - name: memory-by-entity
+    uriTemplate: "c3://memory/{app}/{entity_type}"
+    description: Memory entities by app and type
+    mimeType: application/json
+  - name: media-by-id
+    uriTemplate: "c3://media/{messageId}"
+    description: Downloaded media file by message ID
+    mimeType: application/octet-stream
+
+# ── Media dispatch (tool → adapter method + extra kwargs) ────────────────────
+media_dispatch:
+  send_image: [send_image, [caption]]
+  send_video: [send_video, [caption]]
+  send_audio: [send_audio, [ptt]]
+  send_document: [send_document, [filename, mimetype]]
+
+media_defaults:
+  caption: ""
+  filename: ""
+  mimetype: ""
+  ptt: false
+
+# ── Bridge reconnection ─────────────────────────────────────────────────────
+bridge:
+  max_restarts: 5
+  backoff_base: 3
+
+# ── Sanitization regexes ────────────────────────────────────────────────────
+sanitize:
+  tag_regex: "<[^>]{1,50}>"
+  injection_regex: "(?:^|\\n)(Human|Assistant|System):"
+  injection_replace: "\\n[\\1]:"
+
+# ── Approval flow ───────────────────────────────────────────────────────────
+approval:
+  options: ["Yes — allow", "No — block"]
+  yes_keyword: "yes"
+
+# ── User-facing messages (i18n-ready) ────────────────────────────────────────
+messages:
+  # Session commands
+  stop_poll_question: "🛑 Stop the session anytime"
+  stop_poll_options: ["Stop now"]
+  start_notify: "HOST WANTS TO START\nHost: (host)\nArgs: {args}"
+  stop_notify: "HOST COMMAND: STOP\nStopped by (host)."
+  stop_confirm: "✅ Stop signal sent."
+  clear_confirm: "🧹 Session cleared. Next restart = fresh session."
+  status_format: "📊 Sessions: {sessions} | Timers: {timers}"
+  stop_poll_notify: "HOST COMMAND: STOP (poll)"
+
+  # App management
+  app_list_format: "📦 Available: {available}\n✅ Loaded: {loaded}"
+  app_not_found: "❌ App '{name}' not found. Try /app list"
+  app_loaded: "✅ App '{name}' loaded"
+  app_unloaded: "✅ App '{name}' unloaded"
+  app_unload_notify: "App '{name}' has been unloaded. Stop using its behaviors."
+  app_usage: "Usage: /app list | /app add <name> | /app remove <name>"
+
+  # Catchup
+  catchup_header: "CATCHUP — {count} missed message(s):\n\n"
+  catchup_confirm: "📬 {count} missed message(s) sent to Claude for processing."
+  catchup_empty: "No missed messages."
+
+  # Phase timer
+  phase_expired: "PHASE EXPIRED: {phase}\nTime is up. Resolve and advance."
+  phase_no_votes: "\nNo votes received."
+  phase_votes_header: "\nFINAL VOTES:\n"
+
+  # Session lifecycle
+  session_fresh: "SESSION START (fresh)"
+  session_resumed: "SESSION RESUMED (restart #{count})"
+  session_body: "{label}\nsession_id: {sid}\nstarted_at: {sat}\nPrevious context may be available from prior session."
+
+  # Approval
+  approval_dm_question: "Allow DM to {token}?"
+  approval_dm_detail: "🔐 Bot wants to DM *{token}*:\n_{preview}_"
+  approval_elevation_question: "Allow {name} to DM?"
+  approval_elevation_detail: "🔐 *{name}* wants to DM the bot."
+
+  # Error messages
+  error_tool_not_allowed: "Error: tool '{name}' is not allowed by app policy"
+  error_unknown_tool: "Unknown tool: {name}"
+  error_not_in_session: "Error: cannot send — recipient not in session"
+  error_question_required: "Error: question required"
+  error_options_invalid: "Error: options must be array ≥2"
+  error_group_not_resolved: "Error: group not resolved"
+  error_path_required: "Error: path required"
+  error_file_not_found: "Error: file not found: {path}"
+  error_media_not_supported: "Error: media not supported"
+  error_message_id_required: "Error: message_id required"
+  error_reactions_not_supported: "Error: reactions not supported by this adapter"
+  error_no_active_session: "Error: no active session"
+  error_entity_required: "Error: entity required"
+  error_entity_fields: "Error: entity must include 'app' and 'entity' fields"
+  error_delete_filter_required: "Error: at least one filter (app, entity_type, name) required"
+  error_name_required: "Error: name required"
+  error_app_not_found: "Error: app '{name}' not found"
+  error_invalid_invite: "Error: invalid invite link"
+  error_path_outside: "Error: path must be within agent directory"
+  error_md_restricted: "Error: .md in app dirs only at <app>/CLAUDE.md or <app>/skills/"
+  error_memory_denied: "Error: memory access denied — app '{app}' not in allowed_resources"
+  denied_dm: "denied: host blocked DM to {token}"
+
+# ── Prerequisites check ─────────────────────────────────────────────────────
+prereqs:
+  checks:
+    - cmd: node
+      missing: "Node.js not found — install 18+ from nodejs.org"
+    - cmd: claude
+      missing: "Claude Code CLI not found"
+    - cmd: npm
+      missing: "npm not found"
+  node_too_old: "Node.js too old — need {min_version}+"
+
+# ── CLI prompts ──────────────────────────────────────────────────────────────
+prompts:
+  app_new: "Create c3 app '{name}': {description}. Read c3://schema/app. Generate CLAUDE.md, update app.json, create skills in {name}/skills/. Use save_file."
+  review_skill: "Review {app}/skills/{file}. Check {rules}. Rewrite with save_file if needed."
+  review_prompt: "Review {app}/CLAUDE.md. Check {rules}. Rewrite with save_file if needed."
+  gen_skill: "Generate skill for '{app}': {source}. Follow {rules}. Save to {app}/skills/ with save_file."
+  gen_prompt: "Generate CLAUDE.md for '{app}': {source}. Save to {app}/CLAUDE.md with save_file."
+  mcp_added: "MCP '{server}' added to '{app}'. Update {app}/app.json allowed_tools with save_file."
+
+rules: "rules (reply via MCP, polls for choices, memory for persistence)"
+
+check_files:
+  - [config.json, "no hosts configured"]
+  - [app.json, "using default RBAC"]
+  - [CLAUDE.md, "no custom instructions"]
+
+# ── Tool definitions (JSON Schema) ──────────────────────────────────────────
+tools:
+  - name: reply
+    description: Send a message to a user or group.
+    properties:
+      jid: {type: string, description: "Token: 'host', 'group', or a name"}
+      text: {type: string}
+    required: [jid, text]
+
+  - name: send_private
+    description: Send a private DM.
+    properties:
+      jid: {type: string}
+      text: {type: string}
+    required: [jid, text]
+
+  - name: send_poll
+    description: Send a single-choice WhatsApp poll.
+    properties:
+      group_jid: {type: string}
+      question: {type: string}
+      options: {type: array, items: {type: string}, minItems: 2, maxItems: 12}
+    required: [group_jid, question, options]
+
+  - name: get_group_members
+    description: Get the member list of a WhatsApp group.
+    properties:
+      group_jid: {type: string}
+    required: [group_jid]
+
+  - name: resolve_group
+    description: Resolve a WhatsApp invite link to a group JID.
+    properties:
+      invite_link: {type: string, description: "https://chat.whatsapp.com/..."}
+    required: [invite_link]
+
+  - name: set_timer
+    description: Start a named countdown.
+    properties:
+      seconds: {type: number}
+      name: {type: string, description: Timer label}
+      group_jid: {type: string, description: Optional group context}
+    required: [seconds, name]
+
+  - name: end_session
+    description: End the active session.
+    properties:
+      group_jid: {type: string, description: "Optional — clears specific group, or all if omitted"}
+
+  - name: memory_write
+    description: Store an entity in persistent memory.
+    properties:
+      entity: {type: object, description: "Must include 'app' and 'entity' fields"}
+    required: [entity]
+
+  - name: memory_read
+    description: Read entities from memory.
+    properties:
+      app: {type: string, description: Filter by app name}
+      entity_type: {type: string, description: Filter by entity type}
+
+  - name: memory_search
+    description: Full-text search across all memory.
+    properties:
+      query: {type: string}
+    required: [query]
+
+  - name: memory_delete
+    description: Delete matching entities from memory.
+    properties:
+      app: {type: string}
+      entity_type: {type: string}
+      name: {type: string}
+
+  - name: send_image
+    description: Send an image file.
+    properties:
+      jid: {type: string, description: "Token: 'host', 'group', or a name"}
+      path: {type: string, description: Absolute path to file}
+      caption: {type: string, description: Optional caption}
+    required: [jid, path]
+
+  - name: send_audio
+    description: Send an audio file or voice note.
+    properties:
+      jid: {type: string, description: "Token: 'host', 'group', or a name"}
+      path: {type: string, description: Absolute path to file}
+      ptt: {type: boolean, description: Voice note}
+    required: [jid, path]
+
+  - name: send_video
+    description: Send a video file.
+    properties:
+      jid: {type: string, description: "Token: 'host', 'group', or a name"}
+      path: {type: string, description: Absolute path to file}
+      caption: {type: string, description: Optional caption}
+    required: [jid, path]
+
+  - name: send_document
+    description: Send a document/file.
+    properties:
+      jid: {type: string, description: "Token: 'host', 'group', or a name"}
+      path: {type: string, description: Absolute path to file}
+      filename: {type: string, description: Display filename}
+      mimetype: {type: string, description: MIME type}
+    required: [jid, path]
+
+  - name: react
+    description: React to a message with an emoji.
+    properties:
+      jid: {type: string, description: "Token: 'host', 'group', or a name"}
+      message_id: {type: string, description: Message ID}
+      emoji: {type: string, description: Emoji}
+    required: [jid, message_id, emoji]
+
+  - name: load_app
+    description: Load an app's skills and MCP tools on demand.
+    properties:
+      name: {type: string, description: App name or skill name}
+    required: [name]
+
+  - name: save_file
+    description: Write content to a file in the data directory.
+    properties:
+      path: {type: string, description: Relative path}
+      content: {type: string}
+    required: [path, content]

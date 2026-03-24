@@ -1,0 +1,15 @@
+{
+  "name": "appstore",
+  "description": "Discover and install apps from GitHub, MCP registries, HuggingFace, and npm",
+  "trust_level": "builtin",
+  "access": {
+    "commands": {},
+    "dm": ["hosts"],
+    "group": []
+  },
+  "memory_schema": {
+    "installed": { "fields": ["name", "source", "version", "trust_level", "installed_at"] },
+    "search": { "fields": ["query", "results_count", "selected"] },
+    "registry": { "fields": ["name", "url", "type", "enabled"] }
+  }
+}

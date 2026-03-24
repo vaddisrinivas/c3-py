@@ -1,0 +1,107 @@
+{
+  "$defs": {
+    "AccessPolicy": {
+      "properties": {
+        "commands": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {},
+          "title": "Commands",
+          "type": "object"
+        },
+        "dm": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Dm",
+          "type": "array"
+        },
+        "group": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Group",
+          "type": "array"
+        }
+      },
+      "title": "AccessPolicy",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "name": {
+      "title": "Name",
+      "type": "string"
+    },
+    "access": {
+      "$ref": "#/$defs/AccessPolicy"
+    },
+    "trust_level": {
+      "default": "builtin",
+      "enum": [
+        "builtin",
+        "verified",
+        "community",
+        "untrusted"
+      ],
+      "title": "Trust Level",
+      "type": "string"
+    },
+    "sandboxed": {
+      "default": false,
+      "title": "Sandboxed",
+      "type": "boolean"
+    },
+    "allowed_tools": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Allowed Tools",
+      "type": "array"
+    },
+    "allowed_resources": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Allowed Resources",
+      "type": "array"
+    },
+    "description": {
+      "default": "",
+      "title": "Description",
+      "type": "string"
+    },
+    "memory_schema": {
+      "additionalProperties": true,
+      "default": {},
+      "title": "Memory Schema",
+      "type": "object"
+    },
+    "crons": {
+      "default": [],
+      "items": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "type": "object"
+      },
+      "title": "Crons",
+      "type": "array"
+    }
+  },
+  "required": [
+    "name",
+    "access"
+  ],
+  "title": "AppManifest",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

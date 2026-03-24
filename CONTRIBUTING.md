@@ -53,18 +53,17 @@ uv run pytest tests/test_foo.py  # run a single file
 
 | Section | What it does |
 |---|---|
-| `Types` | Core dataclasses: `WAMessage`, `AppConfig`, `PluginManifest`, etc. |
+| `Types` | Core dataclasses: `WAMessage`, `AppConfig`, `AppManifest`, etc. |
 | `Utilities` | Logging helpers, `parse_duration`, `pick` |
-| `JidMask` | Allow/deny matching for JIDs |
-| `PluginController` | Loads and manages plugin manifests |
-| `SessionEngine` | Per-chat game/session lifecycle |
-| `Built-in tools` | MCP tool definitions exposed to the LLM |
-| `ChannelCore` | Message routing, command dispatch, reply logic |
+| `RBAC` | `AccessControl` — role-based access, JID masking, trust tagging |
+| `SessionEngine` | Per-chat session lifecycle (commands, polls, timers) |
+| `MCP Tools & Core` | Tool definitions, `ChannelCore`, memory helpers |
+| `Manifests` | Default manifest, merge logic |
 | `BaileysAdapter` | WebSocket bridge to the Baileys JS process |
-| `Framework entry point` | `create_channel()` wires everything together |
+| `Channel` | `create_channel()` wires everything together |
 | `Entry point` | CLI commands: `init`, `auth`, `setup`, `check` |
 
-Bundled games live in `c3/plugin/games/` as Markdown prompt files and are loaded at startup.
+Bundled apps live in `c3/apps/` (e.g. `c3/apps/games/`) as Markdown prompt files and JSON configs, loaded at startup.
 
 ## Pull request guidelines
 
@@ -72,4 +71,4 @@ Bundled games live in `c3/plugin/games/` as Markdown prompt files and are loaded
 - **Tests are required.** New behaviour without tests will not be merged.
 - **Update `CHANGELOG.md`** under the `[Unreleased]` section using Keep a Changelog format.
 - Keep commit messages short and in the imperative mood ("add X", "fix Y").
-- If you're adding a game, drop a `.md` file in `c3/plugin/games/` and reference it in the PR description.
+- If you're adding a game, drop a `.md` file in `c3/apps/games/skills/` and reference it in the PR description.

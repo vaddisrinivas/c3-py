@@ -74,6 +74,15 @@ claude-auth/
 # Stray files from terminal escape codes
 xterm.js*
 
+# Local-only apps (not shipped — personal/experimental)
+c3/apps/lifeos/
+c3/apps/memes/
+c3/apps/photoocr/
+c3/apps/status/
+c3/apps/voicememo/
+c3/apps/calendar/
+c3/apps/mealprep/
+
 # OS
 .DS_Store
 Thumbs.db

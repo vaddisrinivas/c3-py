@@ -3,6 +3,7 @@ import makeWASocket, {
   Browsers,
   DisconnectReason,
   decryptPollVote,
+  downloadMediaMessage,
   fetchLatestBaileysVersion,
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
@@ -11,13 +12,19 @@ import makeWASocket, {
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys'
 import { createHash, randomBytes } from 'crypto'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { basename, extname, join } from 'path'
+import { fileURLToPath } from 'url'
 import pino from 'pino'
 import qrcode from 'qrcode-terminal'
 import { createInterface } from 'readline'
 
 const logger   = pino({ level: 'silent' }, pino.destination(2))
 const SESSIONS = process.env.SESSIONS_DIR ?? './sessions'
+const MEDIA_DIR = join(SESSIONS, 'media')
 const ALLOWED  = new Set((process.env.ALLOWED_SENDERS ?? '').split(',').map(s => s.trim()).filter(Boolean))
+
+mkdirSync(MEDIA_DIR, { recursive: true })
 
 let sock             = null
 let adminJid         = ''
@@ -26,6 +33,21 @@ let reconnectAttempts = 0
 const nameCache  = new Map()
 const pollStore  = new Map()
 const lidToPhone = new Map()
+const LAST_SEEN_FILE = join(SESSIONS, 'last_seen.json')
+const processedIds   = new Set()
+
+function loadLastSeen() {
+  try {
+    if (existsSync(LAST_SEEN_FILE)) return JSON.parse(readFileSync(LAST_SEEN_FILE, 'utf8')).timestamp || 0
+  } catch {}
+  return 0
+}
+
+function saveLastSeen(ts) {
+  try { writeFileSync(LAST_SEEN_FILE, JSON.stringify({ timestamp: ts })) } catch {}
+}
+
+let lastSeenTs = loadLastSeen()
 
 function emit(obj)         { process.stdout.write(JSON.stringify(obj) + '\n') }
 function log(tag, msg)     { process.stderr.write(`[${tag}] ${msg}\n`) }
@@ -85,16 +107,27 @@ async function connect() {
   })
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
-    if (type !== 'notify') return
+    const isCatchup = type === 'append'
+    if (type !== 'notify' && type !== 'append') return
+
     for (const raw of messages) {
       try {
         if (!raw.message) continue
+
+        const msgId = raw.key.id
+        if (msgId && processedIds.has(msgId)) continue
+        if (msgId) processedIds.add(msgId)
+
+        const msgTs = Number(raw.messageTimestamp ?? 0)
+        if (isCatchup && msgTs > 0 && msgTs <= lastSeenTs) continue
+
         if (raw.pushName) {
           const cacheJid = raw.key.participant ?? (raw.key.remoteJid?.endsWith('@g.us') ? null : raw.key.remoteJid)
           if (cacheJid) nameCache.set(cacheJid, raw.pushName)
         }
+
         const pollUpdateMsg = raw.message.pollUpdateMessage
-        if (pollUpdateMsg) { handlePollVote(raw, pollUpdateMsg); continue }
+        if (pollUpdateMsg) { if (!isCatchup) handlePollVote(raw, pollUpdateMsg); continue }
 
         const normalised = normalizeMessageContent(raw.message)
         if (!normalised) continue
@@ -108,8 +141,11 @@ async function connect() {
 
         if (!isGroup && ALLOWED.size > 0 && !ALLOWED.has(sender)) continue
 
-        const text = extractText(normalised)
-        if (!text) continue
+        const content = extractText(normalised)
+        if (!content) continue
+
+        const ts = msgTs || Math.floor(Date.now() / 1000)
+        const mediaInfo = detectMedia(normalised)
 
         emit({
           event: 'message',
@@ -117,15 +153,49 @@ async function connect() {
             jid,
             sender,
             pushName:  raw.pushName ?? nameCache.get(sender) ?? sender.split('@')[0],
-            text,
-            timestamp: Number(raw.messageTimestamp ?? Math.floor(Date.now() / 1000)),
+            text: content,
+            timestamp: ts,
             isGroup,
-            messageId: raw.key.id,
+            messageId: msgId,
+            ...(isCatchup ? { catchup: true } : {}),
+            ...(mediaInfo ? {
+              mediaType:     mediaInfo.type,
+              mediaMimetype: mediaInfo.mimetype ?? null,
+              mediaSize:     mediaInfo.fileSize ?? null,
+              mediaDuration: mediaInfo.seconds ?? null,
+              mediaFileName: mediaInfo.fileName ?? null,
+            } : {}),
           },
         })
+
+        if (mediaInfo && msgId) {
+          downloadMediaMessage(raw, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage })
+            .then(buffer => {
+              const ext = mediaInfo.ext || '.bin'
+              const filename = `${msgId}${ext}`
+              const mediaPath = join(MEDIA_DIR, filename)
+              writeFileSync(mediaPath, buffer)
+              log('media', `saved ${mediaInfo.type} → ${filename} (${buffer.length} bytes)`)
+              emit({ event: 'media_ready', messageId: msgId, mediaPath, mediaType: mediaInfo.type })
+            })
+            .catch(err => log('media', `download failed: ${err.message ?? err}`))
+        }
+
+        if (ts > lastSeenTs) { lastSeenTs = ts; saveLastSeen(ts) }
       } catch (err) {
         log('bridge', `message error: ${err}`)
       }
+    }
+
+    if (processedIds.size > 10000) {
+      const arr = [...processedIds]; processedIds.clear()
+      for (const id of arr.slice(-5000)) processedIds.add(id)
+    }
+
+    // Cap pollStore to prevent memory leak
+    if (pollStore.size > 500) {
+        const keys = [...pollStore.keys()]
+        for (const k of keys.slice(0, keys.length - 200)) pollStore.delete(k)
     }
   })
 }
@@ -139,9 +209,19 @@ function translateLid(jid) {
 
 function extractText(msg) {
   if (msg.conversation)                return msg.conversation
-  if (msg.extendedTextMessage?.text)   return msg.extendedTextMessage.text
-  if (msg.imageMessage?.caption)       return msg.imageMessage.caption
-  if (msg.videoMessage?.caption)       return msg.videoMessage.caption
+  if (msg.extendedTextMessage) {
+    const ext = msg.extendedTextMessage
+    if (ext.matchedText) return `[link: ${ext.matchedText}]${ext.text ? ` ${ext.text}` : ''}`
+    if (ext.text) return ext.text
+  }
+  if (msg.imageMessage) {
+    const cap = msg.imageMessage.caption
+    return cap ? `[image] ${cap}` : '[image]'
+  }
+  if (msg.videoMessage) {
+    const cap = msg.videoMessage.caption
+    return cap ? `[video] ${cap}` : '[video]'
+  }
   if (msg.audioMessage) {
     const ptt  = msg.audioMessage.ptt
     const secs = msg.audioMessage.seconds
@@ -157,7 +237,22 @@ function extractText(msg) {
     const { degreesLatitude: lat = 0, degreesLongitude: lng = 0, name = '' } = msg.locationMessage
     return `[location: ${lat},${lng}${name ? ` | ${name}` : ''}]`
   }
+  if (msg.liveLocationMessage) {
+    const { degreesLatitude: lat = 0, degreesLongitude: lng = 0, caption = '' } = msg.liveLocationMessage
+    return `[live location: ${lat},${lng}${caption ? ` | ${caption}` : ''}]`
+  }
   if (msg.contactMessage) return `[contact: ${msg.contactMessage.displayName ?? 'unknown'}]`
+  if (msg.contactsArrayMessage) {
+    const names = (msg.contactsArrayMessage.contacts ?? [])
+      .map(c => c.displayName ?? 'unknown')
+    return `[contacts: ${names.join(', ')}]`
+  }
+  if (msg.eventMessage) {
+    const ev = msg.eventMessage
+    const title = ev.name ?? ev.title ?? 'untitled'
+    const time = ev.startTime ? new Date(Number(ev.startTime) * 1000).toISOString() : ''
+    return `[event: ${title}${time ? ` | ${time}` : ''}]`
+  }
   if (msg.reactionMessage) {
     const emoji = msg.reactionMessage.text
     const id    = msg.reactionMessage.key?.id ?? ''
@@ -165,6 +260,47 @@ function extractText(msg) {
   }
   if (msg.protocolMessage?.type === proto.Message.ProtocolMessage.Type.REVOKE)
     return `[deleted: ${msg.protocolMessage.key?.id ?? ''}]`
+  return null
+}
+
+function detectMedia(msg) {
+  if (msg.imageMessage) return {
+    type: 'image', ext: '.jpg',
+    mimetype: msg.imageMessage.mimetype || 'image/jpeg',
+    fileSize: msg.imageMessage.fileLength ?? null,
+  }
+  if (msg.videoMessage) return {
+    type: 'video', ext: '.mp4',
+    mimetype: msg.videoMessage.mimetype || 'video/mp4',
+    fileSize: msg.videoMessage.fileLength ?? null,
+    seconds:  msg.videoMessage.seconds ?? null,
+  }
+  if (msg.audioMessage) return {
+    type: msg.audioMessage.ptt ? 'voice_note' : 'audio',
+    ext:  msg.audioMessage.ptt ? '.ogg' : '.mp3',
+    mimetype: msg.audioMessage.mimetype || 'audio/ogg',
+    fileSize: msg.audioMessage.fileLength ?? null,
+    seconds:  msg.audioMessage.seconds ?? null,
+  }
+  if (msg.stickerMessage) return {
+    type: 'sticker', ext: '.webp',
+    mimetype: msg.stickerMessage.mimetype || 'image/webp',
+    fileSize: msg.stickerMessage.fileLength ?? null,
+  }
+  if (msg.documentMessage) {
+    const name = msg.documentMessage.fileName || 'file'
+    const ext  = extname(name) || '.bin'
+    return {
+      type: 'document', ext, fileName: name,
+      mimetype: msg.documentMessage.mimetype || 'application/octet-stream',
+      fileSize: msg.documentMessage.fileLength ?? null,
+    }
+  }
+  if (msg.liveLocationMessage?.jpegThumbnail) return {
+    type: 'live_location', ext: '.jpg',
+    mimetype: 'image/jpeg',
+    fileSize: msg.liveLocationMessage.jpegThumbnail.length ?? null,
+  }
   return null
 }
 
@@ -256,7 +392,6 @@ async function handleCommand(cmd) {
       case 'getGroupMembers': {
         if (!sock) throw new Error('not connected')
         const meta = await sock.groupMetadata(cmd.groupJid)
-        // Build LID→phone mapping from group participants
         for (const p of meta.participants) {
           if (p.lid) {
             const lidUser = p.lid.split(':')[0].split('@')[0]
@@ -275,6 +410,37 @@ async function handleCommand(cmd) {
             name:    nameCache.get(p.id) ?? nameCache.get(p.lid) ?? p.id.split('@')[0],
             isAdmin: p.admin === 'admin' || p.admin === 'superadmin',
           })))
+        break
+      }
+      case 'sendImage': case 'sendVideo': case 'sendAudio': case 'sendDocument': {
+        if (!sock) throw new Error('not connected')
+        const buf = readFileSync(cmd.path)
+        const mediaMsg = cmd.cmd === 'sendImage'    ? { image: buf, caption: cmd.caption || '' }
+                       : cmd.cmd === 'sendVideo'    ? { video: buf, caption: cmd.caption || '' }
+                       : cmd.cmd === 'sendAudio'    ? { audio: buf, ptt: cmd.ptt ?? false, mimetype: cmd.ptt ? 'audio/ogg; codecs=opus' : 'audio/mpeg' }
+                       :                              { document: buf, fileName: cmd.fileName || basename(cmd.path), mimetype: cmd.mimetype || 'application/octet-stream' }
+        await sock.sendMessage(cmd.jid, mediaMsg)
+        respond(id, 'sent')
+        break
+      }
+      case 'sendReaction': {
+        if (!sock) throw new Error('not connected')
+        await sock.sendMessage(cmd.jid, {
+          react: { text: cmd.emoji, key: { remoteJid: cmd.jid, id: cmd.messageId } },
+        })
+        respond(id, 'ok')
+        break
+      }
+      case 'sendPresence': {
+        if (!sock) throw new Error('not connected')
+        await sock.sendPresenceUpdate(cmd.presence || 'composing', cmd.jid)
+        respond(id, 'ok')
+        break
+      }
+      case 'sendReadReceipt': {
+        if (!sock) throw new Error('not connected')
+        await sock.readMessages([{ remoteJid: cmd.jid, id: cmd.messageId }])
+        respond(id, 'ok')
         break
       }
       default:

@@ -23,24 +23,27 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin/c3-py /usr/local/bin/c3-py
 
-RUN uv pip install --system --no-cache "mcp-approval-proxy @ git+https://github.com/vaddisrinivas/mcp-approval-proxy.git@master"
-
 COPY c3/ /app/c3/
 COPY package.json package-lock.json* /app/
 WORKDIR /app
-RUN npm install --production --ignore-scripts --silent
+RUN npm install --production --ignore-scripts --silent \
+    && ln -sf /app/node_modules /usr/local/lib/python3.12/site-packages/c3/node_modules
 
 # Non-root user
 RUN useradd -m -u 1001 -s /bin/bash c3
-RUN mkdir -p /plugin/sessions /home/c3/.claude/projects && chown -R c3:c3 /plugin /home/c3/.claude
+RUN mkdir -p /data/sessions /home/c3/.claude/projects && chown -R c3:c3 /data /home/c3/.claude
 USER c3
 
 # Install Claude Code native binary
 RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/home/c3/.local/bin:${PATH}"
 
-VOLUME ["/plugin", "/home/c3/.claude"]
+VOLUME ["/data", "/home/c3/.claude"]
 ENV PYTHONUNBUFFERED=1
 
 COPY entrypoint.sh /entrypoint.sh
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD test -f /data/sessions/creds.json && pgrep -f "c3-py" > /dev/null || exit 1
+
 ENTRYPOINT ["/entrypoint.sh"]

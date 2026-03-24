@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | Yes       |
+| 0.2.x   | Yes       |
+| 0.1.x   | No        |
 
 Older versions are not patched. Please upgrade to the latest release before reporting a vulnerability.
 
@@ -26,9 +27,12 @@ We aim to acknowledge reports within 72 hours and to publish a fix or advisory w
 
 The following classes of issues are in scope:
 
-- **Injection detection bypass** — crafted WhatsApp messages that escape the JID mask or access policy checks and execute restricted commands
-- **Authentication bypass** — gaining control of the bot without a valid host or admin JID
+- **Injection detection bypass** — crafted WhatsApp messages that escape access control checks, role tagging, or policy enforcement and execute restricted commands
+- **Authentication bypass** — gaining control of the bot without a valid host JID
+- **Role escalation** — participant gaining host-level access, or bypassing DM elevation approval
+- **Tool/resource policy bypass** — calling tools or reading resources not in `allowed_tools`/`allowed_resources`
 - **JID / session leakage** — one chat's session data (game state, participant list, conversation history) becoming visible to another chat
+- **Cross-app memory access** — community app reading another app's memory via resource patterns
 
 Out-of-scope: rate-limit abuse, spam, denial-of-service against the WhatsApp network itself.
 

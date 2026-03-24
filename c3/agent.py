@@ -1,92 +1,271 @@
-"""c3-py — WhatsApp × Claude Code MCP server."""
+"""c3-py — WhatsApp AI apps via MCP."""
+
 from __future__ import annotations
-import asyncio, contextlib, json, os, re, sys, uuid
+import asyncio
+import contextlib
+import json
+import os
+import re
+import sys
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
-import anyio, dataset as _dataset, typer
+import anyio
+import dataset as _dataset
+import typer
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage, JSONRPCNotification, TextContent, Tool
+from mcp.types import (
+    BlobResourceContents,
+    JSONRPCMessage,
+    JSONRPCNotification,
+    Resource,
+    ResourceTemplate,
+    TextContent,
+    TextResourceContents,
+    Tool,
+)
 from pydantic import BaseModel
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from watchfiles import awatch
 
-class WAMessage(BaseModel):
-    jid: str; sender: str; push_name: str; text: str
-    timestamp: int; is_group: bool; message_id: str | None = None
+# ── Roles ──
+ROLE_HOSTS = "hosts"
+ROLE_ADMINS = "admins"
+ROLE_PARTICIPANTS = "session_participants"
+ROLE_GROUP = "session_group"
+ROLE_ELEVATED = "elevated_participants"
+
+# ── Event types ──
+EVT_MESSAGE = "message"
+EVT_SESSION_STOP = "session_stop"
+EVT_SETUP_START = "setup_start"
+EVT_PHASE_EXPIRED = "phase_expired"
+EVT_POLL_UPDATE = "poll_update"
+EVT_SKILL_LOAD = "skill_load"
+EVT_SKILL_UNLOAD = "skill_unload"
+EVT_SESSION_START = "session_start"
+EVT_CRON_TICK = "cron_tick"
+EVT_TOOLS_CHANGED = "_tools_changed"
+
+# ── Log tags ──
+LOG_POLICY = "policy"
+LOG_BAILEYS = "baileys"
+LOG_ENGINE = "engine"
+LOG_APP = "app"
+LOG_C3 = "c3"
+LOG_TOOL = "tool"
+LOG_CRON = "cron"
+LOG_MEDIA = "media"
+LOG_ERROR = "error"
+
+# ── Files ──
+FILE_APP_JSON = "app.json"
+FILE_AGENT_JSON = "agent.json"
+FILE_CLAUDE_MD = "CLAUDE.md"
+FILE_MCP_JSON = ".mcp.json"
+FILE_CONFIG_JSON = "config.json"
+FILE_MEMORY_DB = "memory.db"
+DIR_SKILLS = "skills"
+DIR_SESSIONS = "sessions"
+DIR_APPS = "apps"
+DIR_LOGS = "logs"
+
+# ── Tokens ──
+TOKEN_HOST = "host"
+TOKEN_GROUP = "group"
+
+# ── Trust levels ──
+TRUST_BUILTIN = "builtin"
+TRUST_COMMUNITY = "community"
+
+# ── Protected files that save_file cannot overwrite ──
+PROTECTED_FILES = {FILE_CONFIG_JSON, FILE_APP_JSON, FILE_AGENT_JSON, FILE_MCP_JSON, FILE_MEMORY_DB}
+
+# ── Allowed entity keys for memory_write ──
+ENTITY_KEYS = {
+    "app",
+    "entity",
+    "name",
+    "value",
+    "data",
+    "score",
+    "tags",
+    "metadata",
+    "notes",
+    "status",
+}
+
+
+class BaileysError(Exception):
+    pass
+
+
+class BaileysDisconnectedError(BaileysError):
+    pass
+
+
+class BaileysTimeoutError(BaileysError):
+    pass
+
+
+from typing import Literal as Lit
+
+MediaType = Lit[
+    "image", "video", "audio", "voice_note", "sticker", "document", "live_location", None
+]
+TrustLevel = Lit["builtin", "verified", "community", "untrusted"]
+
+
+class Message(BaseModel):
+    jid: str
+    sender: str
+    push_name: str
+    text: str
+    timestamp: int
+    is_group: bool
+    message_id: str | None = None
+    media_path: str | None = None
+    media_type: MediaType = None
+    media_mimetype: str | None = None
+    media_size: int | None = None
+    media_duration: int | None = None
+    media_filename: str | None = None
+    catchup: bool = False
+
+
 class GroupMember(BaseModel):
-    jid: str; name: str; is_admin: bool; lid: str | None = None
+    jid: str
+    name: str
+    is_admin: bool
+    lid: str | None = None
+
+
 class HostConfig(BaseModel):
-    jid: str; name: str; lid: str | None = None
-class AppConfig(BaseSettings):
-    # ── Hosts / access ────────────────────────────────────────────────────────
-    hosts: list[HostConfig] = []; admins: list[HostConfig] = []
-    # ── Server ────────────────────────────────────────────────────────────────
-    host: str = "0.0.0.0"          # C3_HOST
-    port: int = 3000               # C3_PORT
-    # ── Timeouts (seconds) ───────────────────────────────────────────────────
-    bridge_connect_timeout: int = 120   # C3_BRIDGE_CONNECT_TIMEOUT
-    baileys_cmd_timeout: int = 30       # C3_BAILEYS_CMD_TIMEOUT
-    plugin_init_timeout: int = 10       # C3_PLUGIN_INIT_TIMEOUT
-    test_message_timeout: int = 20      # C3_TEST_MESSAGE_TIMEOUT
-    phase_expiry_grace: int = 3         # C3_PHASE_EXPIRY_GRACE   (sleep after timer fires)
-    # ── Durations ────────────────────────────────────────────────────────────
-    default_duration: int = 600         # C3_DEFAULT_DURATION     (parse_duration fallback)
-    default_phase_timer: int = 60       # C3_DEFAULT_PHASE_TIMER  (set_phase_timer fallback)
-    # ── Logging ──────────────────────────────────────────────────────────────
-    log_truncate: int = 200             # C3_LOG_TRUNCATE
-    model_config = SettingsConfigDict(env_prefix="C3_", extra="ignore")
+    jid: str
+    name: str
+    lid: str | None = None
 
+
+_PKG = Path(__file__).parent
+import yaml as _yaml
+
+_C = _yaml.safe_load((_PKG / "c3.yaml").read_text())
+_MSG = _C["messages"]
+
+
+def _env(key, default):
+    """Read C3_KEY env var, coerce to type of default."""
+    v = os.environ.get(f"C3_{key.upper()}")
+    if v is None:
+        return default
+    if isinstance(default, bool):
+        return v.lower() in ("1", "true", "yes")
+    try:
+        return type(default)(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _build_app_config():
+    fields = {name: _env(name, _C[path[0]][path[1]]) for name, path in _C["config_fields"].items()}
+    fields["hosts"] = []
+    fields[ROLE_ADMINS] = []
+    annot = {k: type(v) for k, v in fields.items()}
+    annot["hosts"] = list[HostConfig]
+    annot[ROLE_ADMINS] = list[HostConfig]
+    return type("AppConfig", (BaseModel,), {"__annotations__": annot, **fields})
+
+
+AppConfig = _build_app_config()
 _cfg = AppConfig()
-class AccessPolicy(BaseModel):
-    commands: dict[str, list[str]] = {}; dm: list[str] = []; group: list[str] = []
-class PluginManifest(BaseModel):
-    name: str; access: AccessPolicy
-class ToolDef(BaseModel):
-    name: str; description: str; input_schema: dict[str, Any]
-class PluginSession:
-    def grant(self, role: str, entries: list[dict]) -> None: ...
-    def revoke(self, role: str) -> None: ...
+_MIME_TYPES: dict[str, str] = _C["mime_types"]
 
-class PluginMCPProxy:
-    """Spawns a plugin's MCP subprocess and proxies its tools through c3-py."""
-    def __init__(self, name: str, params: dict, plugin_dir: Path):
-        self.name = name; self._params = params; self._plugin_dir = plugin_dir
-        self._session: Any | None = None; self.tools: list[Tool] = []; self._ready = asyncio.Event()
+
+class AccessPolicy(BaseModel):
+    commands: dict[str, list[str]] = {}
+    dm: list[str] = []
+    group: list[str] = []
+
+
+class AppManifest(BaseModel):
+    name: str
+    access: AccessPolicy
+    trust_level: TrustLevel = TRUST_BUILTIN
+    sandboxed: bool = False
+    allowed_tools: list[str] = []
+    allowed_resources: list[str] = []
+    description: str = ""
+    memory_schema: dict[str, Any] = {}
+    crons: list[dict[str, str]] = []
+
+
+class ToolDef(BaseModel):
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
+class AppMCPProxy:
+    def __init__(self, name: str, params: dict, agent_dir: Path):
+        self.name = name
+        self._params = params
+        self._agent_dir = agent_dir
+        self._session: Any | None = None
+        self.tools: list[Tool] = []
+        self._ready = asyncio.Event()
+
     @property
-    def tool_names(self) -> set[str]: return {t.name for t in self.tools}
+    def tool_names(self) -> set[str]:
+        return {t.name for t in self.tools}
+
     async def run(self) -> None:
         from mcp.client.session import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
-        env = {**os.environ, **{k: v.replace("${plugin_dir}", str(self._plugin_dir))
-            for k, v in self._params.get("env", {}).items()}}
-        params = StdioServerParameters(command=self._params["command"], args=self._params.get("args", []), env=env)
+
+        env = {
+            **os.environ,
+            **{
+                k: v.replace("${agent_dir}", str(self._agent_dir))
+                for k, v in self._params.get("env", {}).items()
+            },
+        }
         try:
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize(); result = await session.list_tools()
-                    self.tools = result.tools; self._session = session; self._ready.set()
+            async with stdio_client(
+                StdioServerParameters(
+                    command=self._params["command"], args=self._params.get("args", []), env=env
+                )
+            ) as (r, w):
+                async with ClientSession(r, w) as s:
+                    await s.initialize()
+                    self.tools = (await s.list_tools()).tools
+                    self._session = s
+                    self._ready.set()
                     log("aggregator", f"{self.name}: {len(self.tools)} tools loaded")
                     await anyio.sleep_forever()
-        except Exception as e: log("aggregator", f"{self.name} error: {e}")
-    async def call_tool(self, name: str, arguments: dict) -> list[TextContent]:
-        await asyncio.wait_for(self._ready.wait(), timeout=_cfg.plugin_init_timeout)
-        if not self._session:
-            return [TextContent(type="text", text=f"Error: MCP server '{self.name}' not connected")]
-        result = await self._session.call_tool(name, arguments)
-        return result.content
+        except Exception as e:
+            log("aggregator", f"{self.name} error: {e}")
+        finally:
+            self._session = None
 
-class WAAdapter(ABC):
+    async def call_tool(self, name: str, arguments: dict) -> list[TextContent]:
+        await asyncio.wait_for(self._ready.wait(), timeout=_cfg.app_init_timeout)
+        if not self._session:
+            return _R(f"Error: MCP server '{self.name}' not connected")
+        return (await self._session.call_tool(name, arguments)).content
+
+
+class ChatAdapter(ABC):
     admin_jid: str = ""
-    on_message: Callable[[WAMessage], Awaitable[None]] | None = None
+    on_message: Callable[[Message], Awaitable[None]] | None = None
     on_ready: Callable[[], Awaitable[None]] | None = None
     on_poll_update: Callable[[str, dict], Awaitable[None]] | None = None
+
     @abstractmethod
     async def connect(self) -> None: ...
     @abstractmethod
@@ -97,1045 +276,2178 @@ class WAAdapter(ABC):
     async def resolve_group(self, invite_link: str) -> str: ...
     @abstractmethod
     async def get_group_members(self, group_jid: str) -> list[GroupMember]: ...
+    async def react(self, jid: str, message_id: str, emoji: str) -> None:
+        raise NotImplementedError
+
+    async def send_presence(self, jid: str, presence: str = "composing") -> None:
+        raise NotImplementedError
+
+    async def send_image(self, jid: str, path: str, caption: str = "") -> None:
+        raise NotImplementedError
+
+    async def send_video(self, jid: str, path: str, caption: str = "") -> None:
+        raise NotImplementedError
+
+    async def send_audio(self, jid: str, path: str, ptt: bool = False) -> None:
+        raise NotImplementedError
+
+    async def send_document(
+        self, jid: str, path: str, filename: str = "", mimetype: str = ""
+    ) -> None:
+        raise NotImplementedError
+
     @abstractmethod
     def get_name(self, jid: str) -> str: ...
+    def is_group_id(self, id: str) -> bool:
+        return False
 
+    def is_valid_invite(self, link: str) -> bool:
+        return False
+
+    def extract_name(self, id: str) -> str:
+        return id
+
+
+WAAdapter = ChatAdapter  # compat
+WAMessage = Message  # compat
 _log_file: Path | None = None
+
+
 def setup_logging(d):
-    global _log_file; p = Path(d) / "logs"; p.mkdir(parents=True, exist_ok=True)
+    global _log_file
+    p = Path(d) / DIR_LOGS
+    p.mkdir(parents=True, exist_ok=True)
     _log_file = p / f"c3-{datetime.now().strftime('%Y-%m-%d')}.log"
+
+
 def log(tag, msg):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] [{tag}] {msg}"
     print(line, file=sys.stderr, flush=True)
     if _log_file:
         with contextlib.suppress(Exception):
-            with open(_log_file, "a") as f: f.write(line + "\n")
+            with open(_log_file, "a") as f:
+                f.write(line + "\n")
+
 
 def parse_duration(value: Any, fallback: int | None = None) -> int:
-    if fallback is None: fallback = _cfg.default_duration
-    if value is None or value == "": return fallback
-    if isinstance(value, (int, float)): return int(value)
-    m = re.match(r'^(\d+)(s|m)?$', str(value).strip(), re.I)
-    if not m: return int(str(value)) if str(value).isdigit() else fallback
-    n = int(m.group(1)); return n * 60 if (m.group(2) or "").lower() == "m" else n
+    if fallback is None:
+        fallback = _cfg.default_duration
+    if value is None or value == "":
+        return fallback
+    if isinstance(value, (int, float)):
+        return int(value)
+    m = re.match(r"^(\d+)(s|m)?$", str(value).strip(), re.I)
+    if not m:
+        return int(str(value)) if str(value).isdigit() else fallback
+    n = int(m.group(1))
+    return n * 60 if (m.group(2) or "").lower() == "m" else n
+
 
 def pick(d: dict, *keys: str) -> Any:
     for k in keys:
-        if k in d and d[k] is not None: return d[k]
+        if k in d and d[k] is not None:
+            return d[k]
     return None
 
-class JidMask:
-    def __init__(self):
-        self._jid_to_token: dict[str, str] = {}; self._token_to_jid: dict[str, str] = {}
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _load_manifest(dir_path: Path) -> dict:
+    for f in (FILE_APP_JSON, FILE_AGENT_JSON):
+        d = _read_json(dir_path / f)
+        if d:
+            return d
+    return {}
+
+
+def _scan_dirs(base: Path, bundled: Path):
+    seen: set[str] = set()
+    for root in [base, bundled]:
+        if not root.exists():
+            continue
+        for d in sorted(root.iterdir()):
+            if d.is_dir() and not d.name.startswith(".") and d.name not in seen:
+                seen.add(d.name)
+                yield d.name, d
+
+
+class AccessControl:
+    def __init__(self, manifest: AppManifest, config: AppConfig):
+        self._manifest = manifest
+        self._jid_to_token: dict[str, str] = {}
+        self._token_to_jid: dict[str, str] = {}
+        self._static: dict[str, set[str]] = {}
+        self._dynamic: dict[str, set[str]] = {}
+        self._mask_pairs: list[tuple[str, str]] | None = None
+        self._static["hosts"] = self._register_entries(config.hosts, lambda _: TOKEN_HOST)
+        self._static[ROLE_ADMINS] = self._register_entries(config.admins, lambda _: TOKEN_HOST)
+        log(LOG_POLICY, f"loaded: {manifest.name}")
+
     def register(self, jid: str, token: str) -> None:
-        if not jid or not token: return
+        if not jid or not token:
+            return
+        # Bug #1: disambiguate duplicate tokens
+        orig = token
+        i = 2
+        while token in self._token_to_jid and self._token_to_jid[token] != jid:
+            token = f"{orig}_{i}"
+            i += 1
         self._jid_to_token[jid] = token
-        if token not in self._token_to_jid: self._token_to_jid[token] = jid
-    def alias(self, jid: str, token: str) -> None:
-        if jid and token: self._jid_to_token[jid] = token
+        self._mask_pairs = None  # invalidate cache
+        if token not in self._token_to_jid:
+            self._token_to_jid[token] = jid
+
     def mask(self, text: str) -> str:
-        for jid, token in sorted(self._jid_to_token.items(), key=lambda x: len(x[0]), reverse=True):
+        if self._mask_pairs is None:
+            self._mask_pairs = sorted(
+                self._jid_to_token.items(), key=lambda x: len(x[0]), reverse=True
+            )
+        for jid, token in self._mask_pairs:
             text = text.replace(jid, token)
         return text
-    def unmask(self, token: str) -> str: return self._token_to_jid.get(token, token)
-    def mask_meta(self, meta: dict) -> dict: return {k: self.mask(str(v)) for k, v in meta.items()}
 
-class PluginController:
-    def __init__(self, manifest: PluginManifest, config: AppConfig):
-        self.jid_mask = JidMask(); self._manifest = manifest
-        self._static_roles: dict[str, set[str]] = {}; self._dynamics: dict[str, set[str]] = {}
-        def _reg(entries, tok_fn):
-            jids: set[str] = set()
-            for x in entries:
-                jids.add(x.jid); tok = tok_fn(x)
-                self.jid_mask.register(x.jid, tok)
-                if x.lid: jids.add(x.lid); self.jid_mask.alias(x.lid, tok)
-            return jids
-        self._static_roles["hosts"] = _reg(config.hosts, lambda _: "host")
-        self._static_roles["admins"] = _reg(config.admins,
-            lambda a: "host" if any(h.jid == a.jid for h in config.hosts) else "admin")
-        log("policy", f"loaded: {manifest.name}")
+    def unmask(self, token: str) -> str:
+        return self._token_to_jid.get(token, token)
+
+    def mask_meta(self, meta: dict) -> dict:
+        return {k: self.mask(str(v)) if isinstance(v, str) else v for k, v in meta.items()}
+
+    @staticmethod
+    def _normalize_jid(jid: str) -> str:
+        """Strip device suffix: 123:5@s.whatsapp.net → 123@s.whatsapp.net"""
+        if ":" in jid and "@" in jid:
+            phone, domain = jid.split("@", 1)
+            return phone.split(":")[0] + "@" + domain
+        return jid
+
+    def has_role(self, jid: str, role: str) -> bool:
+        s = self._static.get(role, set()) | self._dynamic.get(role, set())
+        return jid in s or self._normalize_jid(jid) in s
+
+    def is_host(self, jid: str) -> bool:
+        return self.has_role(jid, ROLE_HOSTS)
+
+    def is_participant(self, jid: str) -> bool:
+        return jid in self._dynamic.get(ROLE_PARTICIPANTS, set())
+
+    def is_elevated(self, jid: str) -> bool:
+        return jid in self._dynamic.get(ROLE_ELEVATED, set())
+
+    def is_known(self, jid: str) -> bool:
+        return jid in self._jid_to_token
+
     def can_reach(self, jid: str, is_group: bool, text: str) -> bool:
-        access = self._manifest.access
+        a = self._manifest.access
         if not is_group:
             if text.strip().startswith("/"):
-                cmd = text.strip().split()[0].lower()
-                return any(self._has_role(jid, r) for r in access.commands.get(cmd, []))
-            return any(self._has_role(jid, r) for r in access.dm)
-        return any(self._has_role(jid, r) for r in access.group)
-    def create_session(self) -> PluginSession:
-        ctrl = self
-        class _Session(PluginSession):
-            def grant(self, role: str, entries: list[dict]) -> None:
-                jids: set[str] = set()
-                for e in entries: ctrl.jid_mask.register(e["jid"], e["token"]); jids.add(e["jid"])
-                ctrl._dynamics[role] = jids; log("policy", f"grant({role}): {len(jids)}")
-            def revoke(self, role: str) -> None:
-                ctrl._dynamics.pop(role, None); log("policy", f"revoke({role})")
-        return _Session()
-    def _has_role(self, jid: str, role: str) -> bool:
-        return jid in self._static_roles.get(role, set()) or jid in self._dynamics.get(role, set())
+                return any(
+                    self.has_role(jid, r)
+                    for r in a.commands.get(text.strip().split()[0].lower(), [])
+                )
+            return any(self.has_role(jid, r) for r in a.dm)
+        return any(self.has_role(jid, r) for r in a.group)
+
+    def grant(self, role: str, entries: list[dict]) -> None:
+        for e in entries:
+            self.register(e["jid"], e["token"])
+        self._dynamic.setdefault(role, set()).update(e["jid"] for e in entries)
+        log(LOG_POLICY, f"grant({role}): {len(entries)}")
+
+    def grant_jid(self, role: str, jid: str) -> None:
+        self._dynamic.setdefault(role, set()).add(jid)
+
+    def revoke(self, role: str) -> None:
+        self._dynamic.pop(role, None)
+        log(LOG_POLICY, f"revoke({role})")
+
+    def revoke_all_session(self) -> None:
+        for role in [ROLE_PARTICIPANTS, ROLE_GROUP, ROLE_ELEVATED]:
+            self._dynamic.pop(role, None)
+
+    def _register_entries(self, entries: list[HostConfig], tok_fn) -> set[str]:
+        jids: set[str] = set()
+        for x in entries:
+            jids.add(x.jid)
+            tok = tok_fn(x)
+            self.register(x.jid, tok)
+            if x.lid:
+                jids.add(x.lid)
+                self._jid_to_token[x.lid] = tok
+                self._mask_pairs = None
+        return jids
+
 
 class SessionEngine:
-    def __init__(self, wa: WAAdapter, notify: Callable, ctrl: PluginController, plugin_dir: str | Path = "."):
-        self._wa = wa; self._notify = notify; self._sessions_dir = Path(plugin_dir) / "sessions"
-        self._ctrl = ctrl; self._phase_timers: dict[str, asyncio.TimerHandle] = {}
-        self._poll_listeners: dict[str, Callable] = {}; self._poll_tallies: dict[str, dict] = {}
+    def __init__(
+        self, wa: ChatAdapter, notify: Callable, ctrl: AccessControl, agent_dir: str | Path = "."
+    ):
+        self._wa = wa
+        self._notify = notify
+        self._sessions_dir = Path(agent_dir) / DIR_SESSIONS
+        self._ctrl = ctrl
+        self._phase_timers: dict[str, asyncio.TimerHandle] = {}
+        self._poll_listeners: dict[str, Callable] = {}
+        self._poll_tallies: dict[str, dict] = {}
         self._stop_poll_map: dict[str, str] = {}
-        self._active_sessions: dict[str, str] = {}  # group_jid → session_name
-        self._loaded_plugins: set[str] = set()
+        self._active_sessions: dict[str, str] = {}
+        self._loaded_apps: set[str] = set()
+        self.on_catchup: Callable[[], Awaitable[None]] | None = None
         orig = wa.on_poll_update
+
         async def _poll_handler(poll_id: str, tally: dict) -> None:
-            await self._handle_stop_poll(poll_id, tally); await self._dispatch_poll(poll_id, tally)
-            if orig: await orig(poll_id, tally)
+            await self._handle_stop_poll(poll_id, tally)
+            await self._dispatch_poll(poll_id, tally)
+            if orig:
+                await orig(poll_id, tally)
+
         wa.on_poll_update = _poll_handler
+
     def resolve_group(self, token: str | None) -> str | None:
-        if token and token != "group": return self._ctrl.jid_mask.unmask(token)
+        if token and token != "group":
+            return self._ctrl.unmask(token)
         sessions = list(self._active_sessions.keys())
         return sessions[0] if sessions else None
+
     def set_active(self, group_jid: str, name: str) -> None:
-        self._active_sessions[group_jid] = name; log("engine", f"active: {name} ({len(self._active_sessions)} sessions)")
+        if self._active_sessions and group_jid not in self._active_sessions:
+            self.clear_active()
+        self._active_sessions[group_jid] = name
+        log(LOG_ENGINE, f"active: {name} (1 session)")
+
     def clear_active(self, group_jid: str | None = None) -> None:
-        if group_jid: self._active_sessions.pop(group_jid, None)
-        else: self._active_sessions.clear()
-        log("engine", f"cleared (remaining: {len(self._active_sessions)})")
+        if group_jid:
+            self._active_sessions.pop(group_jid, None)
+        else:
+            self._active_sessions.clear()
+        log(LOG_ENGINE, f"cleared (remaining: {len(self._active_sessions)})")
+
     def track_poll(self, poll_id: str, group_jid: str, question: str) -> None:
-        self._poll_tallies[poll_id] = {}  # accumulate votes
+        self._poll_tallies[poll_id] = {}
+
         async def listener(pid: str, tally: dict) -> None:
-            if pid != poll_id: return
-            self._poll_tallies[poll_id] = tally  # update latest tally
-            lines = [f'POLL UPDATE — "{question}"']
-            for opt, voters in tally.items(): lines.append(f"  {opt}: {len(voters)} votes")
-            await self._notify("\n".join(lines), {"type": "poll_update", "poll_id": poll_id, "group_jid": group_jid})
+            if pid != poll_id:
+                return
+            self._poll_tallies[poll_id] = tally
+            await self._notify(
+                f'POLL UPDATE — "{question}"\n'
+                + "\n".join(f"  {o}: {len(v)} votes" for o, v in tally.items()),
+                {"type": EVT_POLL_UPDATE, "poll_id": poll_id, "group_jid": group_jid},
+            )
+
         self._poll_listeners[poll_id] = listener
 
     def get_poll_tally(self, poll_id: str) -> dict:
-        """Get the full tally with voter names — only call after timer expires."""
-        return self._poll_tallies.pop(poll_id, {})
+        return self._poll_tallies.get(poll_id, {})
+
     async def _dispatch_poll(self, poll_id: str, tally: dict) -> None:
         for listener in list(self._poll_listeners.values()):
-            try: await listener(poll_id, tally)
-            except Exception as e: log("engine", f"poll listener error: {e}")
+            try:
+                await listener(poll_id, tally)
+            except Exception as e:
+                log(LOG_ENGINE, f"poll listener error: {e}")
+
     def set_phase_timer(self, group_jid: str, seconds: int, phase_name: str) -> None:
-        self._cancel_timer(group_jid); loop = asyncio.get_running_loop()
+        self._cancel_timer(group_jid)
+        loop = asyncio.get_running_loop()
+
         async def _fire() -> None:
             await asyncio.sleep(_cfg.phase_expiry_grace)
-            # Include final tallies for any active polls so Claude has real voter data
             tally_lines: list[str] = []
             for pid, tally in list(self._poll_tallies.items()):
                 for opt, voters in tally.items():
                     tally_lines.append(f"  {opt}: {len(voters)} — {', '.join(voters)}")
                 self._poll_tallies.pop(pid, None)
                 self._poll_listeners.pop(pid, None)
-            tally_str = "\nFINAL VOTES:\n" + "\n".join(tally_lines) if tally_lines else "\nNo votes received."
-            await self._notify(f"PHASE EXPIRED: {phase_name}\nTime is up. Resolve and advance.{tally_str}",
-                {"type": "phase_expired", "group_jid": group_jid, "phase": phase_name})
-        self._phase_timers[group_jid] = loop.call_later(seconds, lambda: asyncio.ensure_future(_fire()))
-        log("engine", f"timer: {phase_name} ({seconds}s)")
+            tally_str = (
+                _MSG["phase_votes_header"] + "\n".join(tally_lines)
+                if tally_lines
+                else _MSG["phase_no_votes"]
+            )
+            await self._notify(
+                _MSG[EVT_PHASE_EXPIRED].format(phase=phase_name) + tally_str,
+                {"type": EVT_PHASE_EXPIRED, "group_jid": group_jid, "phase": phase_name},
+            )
+
+        self._phase_timers[group_jid] = loop.call_later(
+            seconds, lambda: asyncio.ensure_future(_fire())
+        )
+        log(LOG_ENGINE, f"timer: {phase_name} ({seconds}s)")
+
     def clear_all_timers(self) -> None:
-        for handle in self._phase_timers.values(): handle.cancel()
-        self._phase_timers.clear(); self._poll_listeners.clear()
+        for handle in self._phase_timers.values():
+            handle.cancel()
+        self._phase_timers.clear()
+        self._poll_tallies.clear()
+        # Clean up poll listeners for phase polls (not stop polls)
+        stop_poll_ids = set(self._stop_poll_map.values())
+        self._poll_listeners = {k: v for k, v in self._poll_listeners.items() if k in stop_poll_ids}
+
     def _cancel_timer(self, group_jid: str) -> None:
         h = self._phase_timers.pop(group_jid, None)
-        if h: h.cancel()
-    def _plugin_dirs(self) -> list[Path]:
-        base = self._sessions_dir.parent; bundled = Path(__file__).parent / "plugins"
-        skill_dirs = []
-        for root in [base, bundled]:
-            if not root.exists(): continue
-            for d in sorted(root.iterdir()):
-                if d.is_dir() and not d.name.startswith("."):
-                    sd = d / "skills"
-                    if sd.is_dir(): skill_dirs.append(sd)
-        return skill_dirs
-    def _list_plugins(self) -> list[str]:
-        return sorted({f.stem for d in self._plugin_dirs() for f in d.glob("*.md")})
-    def _load_plugin_content(self, name: str) -> str | None:
-        for d in self._plugin_dirs():
-            p = d / f"{name}.md"
-            if p.exists(): return p.read_text()
-        return None
-    async def handle(self, msg: WAMessage) -> bool:
-        if msg.is_group or not msg.text.startswith("/"): return False
-        parts = msg.text.strip().split(); cmd = parts[0].lower()
-        if cmd == "/start":
-            stop_id = await self._wa.send_poll(msg.sender, "🛑 Stop the session anytime", ["Stop now"])
-            self._stop_poll_map[msg.sender] = stop_id
-            args = " ".join(parts[1:]) if len(parts) > 1 else ""
-            meta: dict = {"type": "setup_start", "host_jid": "host"}
-            if args: meta["args"] = args
-            await self._notify(f"HOST WANTS TO START\nHost: (host)\nArgs: {args or '(none)'}", meta); return True
-        if cmd == "/stop":
-            self.clear_all_timers(); self.clear_active()
-            await self._notify("HOST COMMAND: STOP\nStopped by (host).", {"type": "session_stop", "host_jid": "host"})
-            await self._wa.send(msg.sender, "✅ Stop signal sent."); return True
-        if cmd == "/status":
-            sessions = len(self._active_sessions); timers = len(self._phase_timers)
-            await self._wa.send(msg.sender, f"📊 Sessions: {sessions} | Timers: {timers}"); return True
-        if cmd == "/plugin":
-            sub = parts[1].lower() if len(parts) > 1 else "list"
-            name = parts[2].lower().removesuffix(".md") if len(parts) > 2 else ""
-            if sub == "list":
-                await self._wa.send(msg.sender, "📦 Available: " + (", ".join(self._list_plugins()) or "none") + "\n✅ Loaded: " + (", ".join(sorted(self._loaded_plugins)) or "none")); return True
-            if sub == "add" and name:
-                content = self._load_plugin_content(name)
-                if not content: await self._wa.send(msg.sender, f"❌ Plugin '{name}' not found. Try /plugin list"); return True
-                self._loaded_plugins.add(name); await self._notify(content, {"type": "skill_load", "skill": name})
-                await self._wa.send(msg.sender, f"✅ Plugin '{name}' loaded"); return True
-            if sub == "remove" and name:
-                self._loaded_plugins.discard(name)
-                await self._notify(f"Plugin '{name}' has been unloaded. Stop using its behaviors.", {"type": "skill_unload", "skill": name})
-                await self._wa.send(msg.sender, f"✅ Plugin '{name}' unloaded"); return True
-            await self._wa.send(msg.sender, "Usage: /plugin list | /plugin add <name> | /plugin remove <name>"); return True
-        return False
+        if h:
+            h.cancel()
+
+    def _app_dirs(self) -> list[Path]:
+        base = self._sessions_dir.parent
+        bundled = _PKG / DIR_APPS
+        return [d / DIR_SKILLS for _, d in _scan_dirs(base, bundled) if (d / DIR_SKILLS).is_dir()]
+
+    def _list_apps(self) -> list[str]:
+        return sorted({f.stem for d in self._app_dirs() for f in d.glob("*.md")})
+
+    def _load_app_content(self, name: str) -> str | None:
+        return next(
+            (p.read_text() for d in self._app_dirs() for p in [d / f"{name}.md"] if p.exists()),
+            None,
+        )
+
+    async def handle(self, msg: Message) -> bool:
+        if msg.is_group or not msg.text.startswith("/"):
+            return False
+        parts = msg.text.strip().split()
+        cmd = parts[0].lower()
+        handler = (
+            self._cmd_app
+            if cmd in ("/app", "/agent")
+            else getattr(self, f"_cmd{cmd.replace('/', '_')}", None)
+        )
+        return await handler(msg, parts) if handler else False
+
+    async def _cmd_start(self, msg, parts) -> bool:
+        # Bug #16: clear old stop poll entry before creating new one
+        self._stop_poll_map.pop(msg.sender, None)
+        self._stop_poll_map[msg.sender] = await self._wa.send_poll(
+            msg.sender, _MSG["stop_poll_question"], _MSG["stop_poll_options"]
+        )
+        args = " ".join(parts[1:]) if len(parts) > 1 else ""
+        await self._notify(
+            _MSG["start_notify"].format(args=args or "(none)"),
+            {"type": EVT_SETUP_START, "host_jid": TOKEN_HOST, **({"args": args} if args else {})},
+        )
+        return True
+
+    async def _cmd_stop(self, msg, parts) -> bool:
+        self.clear_all_timers()
+        self.clear_active()
+        await self._notify(_MSG["stop_notify"], {"type": EVT_SESSION_STOP, "host_jid": TOKEN_HOST})
+        await self._wa.send(msg.sender, _MSG["stop_confirm"])
+        return True
+
+    async def _cmd_catchup(self, msg, parts) -> bool:
+        if self.on_catchup:
+            await self.on_catchup()
+        return True
+
+    async def _cmd_clear(self, msg, parts) -> bool:
+        self.clear_all_timers()
+        self.clear_active()
+        await self._wa.send(msg.sender, _MSG["clear_confirm"])
+        self._sessions_dir.mkdir(parents=True, exist_ok=True)
+        (self._sessions_dir / "clear_session").write_text("1")
+        return True
+
+    async def _cmd_status(self, msg, parts) -> bool:
+        await self._wa.send(
+            msg.sender,
+            _MSG["status_format"].format(
+                sessions=len(self._active_sessions), timers=len(self._phase_timers)
+            ),
+        )
+        return True
+
+    async def _cmd_app(self, msg, parts) -> bool:
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+        name = parts[2].lower().removesuffix(".md") if len(parts) > 2 else ""
+        if sub == "list":
+            await self._wa.send(
+                msg.sender,
+                _MSG["app_list_format"].format(
+                    available=", ".join(self._list_apps()) or "none",
+                    loaded=", ".join(sorted(self._loaded_apps)) or "none",
+                ),
+            )
+            return True
+        if sub == "add" and name:
+            content = self._load_app_content(name)
+            if not content:
+                await self._wa.send(msg.sender, _MSG["app_not_found"].format(name=name))
+                return True
+            self._loaded_apps.add(name)
+            await self._notify(content, {"type": EVT_SKILL_LOAD, "skill": name})
+            await self._wa.send(msg.sender, _MSG["app_loaded"].format(name=name))
+            return True
+        if sub == "remove" and name:
+            self._loaded_apps.discard(name)
+            await self._notify(
+                _MSG["app_unload_notify"].format(name=name),
+                {"type": EVT_SKILL_UNLOAD, "skill": name},
+            )
+            await self._wa.send(msg.sender, _MSG["app_unloaded"].format(name=name))
+            return True
+        await self._wa.send(msg.sender, _MSG["app_usage"])
+        return True
+
     async def _handle_stop_poll(self, poll_id: str, tally: dict) -> None:
         for host_jid, stop_id in list(self._stop_poll_map.items()):
-            if poll_id != stop_id: continue
-            # Only the host who created this stop poll can trigger it
+            if poll_id != stop_id:
+                continue
             for _opt, voters in tally.items():
-                if not any(host_jid in v or host_jid.split(":")[0] in v for v in [voters]): continue
-                del self._stop_poll_map[host_jid]; self.clear_all_timers(); self.clear_active()
-                await self._notify("HOST COMMAND: STOP (poll)", {"type": "session_stop", "host_jid": "host"})
-                await self._wa.send(host_jid, "✅ Stop signal sent."); return
+                phone = host_jid.split(":")[0] if ":" in host_jid else host_jid
+                norm = AccessControl._normalize_jid(host_jid)
+                if not any(v in voters for v in {host_jid, phone, norm}):
+                    continue
+                del self._stop_poll_map[host_jid]
+                self.clear_all_timers()
+                self.clear_active()
+                await self._notify(
+                    _MSG["stop_poll_notify"], {"type": EVT_SESSION_STOP, "host_jid": TOKEN_HOST}
+                )
+                await self._wa.send(host_jid, "✅ Stop signal sent.")
+                return
 
-def _T(n, d, p, r=None): return ToolDef(name=n, description=d, input_schema={"type": "object", "properties": p, **({"required": r} if r else {})})
-_s = lambda d="": {"type": "string", "description": d} if d else {"type": "string"}
-_n = {"type": "number"}; _obj = {"type": "object"}
-_arr = {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 12}
+
+def _R(t):
+    return [TextContent(type="text", text=t)]
+
 
 BASE_TOOLS: list[ToolDef] = [
-    # ── Messaging ────────────────────────────────────────────────────────────
-    _T("reply", "Send a message to a user or group.", {"jid": _s("Token: 'host', 'group', or a name"), "text": _s()}, ["jid", "text"]),
-    _T("send_private", "Send a private DM.", {"jid": _s(), "text": _s()}, ["jid", "text"]),
-    _T("send_poll", "Send a single-choice WhatsApp poll.",
-        {"group_jid": _s(), "question": _s(), "options": _arr}, ["group_jid", "question", "options"]),
-    # ── Groups ───────────────────────────────────────────────────────────────
-    _T("get_group_members", "Get the member list of a WhatsApp group.", {"group_jid": _s()}, ["group_jid"]),
-    _T("resolve_group", "Resolve a WhatsApp invite link to a group JID and register its members.",
-        {"invite_link": _s("https://chat.whatsapp.com/...")}, ["invite_link"]),
-    # ── Session ──────────────────────────────────────────────────────────────
-    _T("set_timer", "Start a named countdown. Fires a timer_expired notification when done.",
-        {"seconds": _n, "name": _s("Timer label"), "group_jid": _s("Optional group context")}, ["seconds", "name"]),
-    _T("end_session", "End the active session — clears timers and revokes participant access.",
-        {"group_jid": _s("Optional — clears specific group, or all if omitted")}),
-    # ── Memory ───────────────────────────────────────────────────────────────
-    _T("memory_write", "Store an entity in persistent memory.",
-        {"entity": {"type": "object", "description": "Must include 'plugin' and 'entity' fields"}}, ["entity"]),
-    _T("memory_read", "Read entities from memory, optionally filtered.",
-        {"plugin": _s("Filter by plugin"), "entity_type": _s("Filter by entity type")}),
-    _T("memory_search", "Full-text search across all memory.", {"query": _s()}, ["query"]),
-    _T("memory_delete", "Delete matching entities from memory.",
-        {"plugin": _s(), "entity_type": _s(), "name": _s()}),
-    # ── Plugins ──────────────────────────────────────────────────────────────
-    _T("load_plugin", "Load a plugin's skills and MCP tools on demand.",
-        {"name": _s("Plugin name or skill name")}, ["name"]),
-    # ── Files ────────────────────────────────────────────────────────────────
-    _T("save_file", "Write content to a file in the data directory.",
-        {"path": _s("Relative path e.g. 'summaries/recap.md'"), "content": _s()}, ["path", "content"]),
+    ToolDef(
+        name=t["name"],
+        description=t["description"],
+        input_schema={
+            "type": "object",
+            "properties": t["properties"],
+            **({"required": t["required"]} if "required" in t else {}),
+        },
+    )
+    for t in _C["tools"]
 ]
 
-def find_plugin_content(name: str, base: Path) -> list[tuple[str, str]]:
-    """Return [(skill_name, content)] for a plugin dir or individual skill under base or bundled."""
-    bundled = Path(__file__).parent / "plugins"
-    for root in [base, bundled]:
-        path = root / name
-        if path.is_dir():
-            out: list[tuple[str, str]] = []
-            claude = path / "CLAUDE.md"
-            if claude.exists():
-                try: out.append((f"{name}/CLAUDE.md", claude.read_text()))
-                except OSError as e: log("plugin", f"failed to read {claude}: {e}")
-            skills_dir = path / "skills"
-            if skills_dir.is_dir():
-                for f in sorted(skills_dir.glob("*.md")):
-                    try: out.append((f.stem, f.read_text()))
-                    except OSError as e: log("plugin", f"failed to read {f}: {e}")
+
+def find_app_content(name: str, base: Path) -> list[tuple[str, str]]:
+    def _r(p):
+        try:
+            return p.read_text()
+        except OSError:
+            return None
+
+    for root in [base, _PKG / DIR_APPS]:
+        p = root / name
+        if p.is_dir():
+            out = [(f"{name}/CLAUDE.md", c) for c in [_r(p / FILE_CLAUDE_MD)] if c]
+            out += [
+                (f.stem, c)
+                for f in (
+                    sorted((p / DIR_SKILLS).glob("*.md")) if (p / DIR_SKILLS).is_dir() else []
+                )
+                for c in [_r(f)]
+                if c
+            ]
             return out
-        for plugin_dir in sorted(root.iterdir()) if root.exists() else []:
-            if plugin_dir.is_dir() and not plugin_dir.name.startswith("."):
-                skill = plugin_dir / "skills" / f"{name}.md"
-                if skill.exists():
-                    try: return [(name, skill.read_text())]
-                    except OSError as e: log("plugin", f"failed to read {skill}: {e}")
+        for d in sorted(root.iterdir()) if root.exists() else []:
+            if (
+                d.is_dir()
+                and not d.name.startswith(".")
+                and (d / DIR_SKILLS / f"{name}.md").exists()
+            ):
+                c = _r(d / DIR_SKILLS / f"{name}.md")
+                if c:
+                    return [(name, c)]
     return []
 
+
 _mem_cache: dict[str, Any] = {}
+
+
 def _mem(base: Path):
     key = str(base)
     if key not in _mem_cache:
-        _mem_cache[key] = _dataset.connect(f"sqlite:///{base}/memory.db", row_type=dict)
+        db = _dataset.connect(f"sqlite:///{base}/memory.db", row_type=dict)
+        if "entities" not in db:
+            db.create_table("entities")
+        _mem_cache[key] = db
     return _mem_cache[key]
 
+
+def _mem_close():
+    """Close all cached database connections."""
+    for db in _mem_cache.values():
+        with contextlib.suppress(Exception):
+            db.close()
+    _mem_cache.clear()
+
+
+_MEDIA_DISPATCH = {k: (v[0], v[1]) for k, v in _C["media_dispatch"].items()}
+
+
+class AdapterApprovalEngine:
+    def __init__(self, wa, ctrl, timeout=120.0):
+        self._wa = wa
+        self._ctrl = ctrl
+        self._timeout = timeout
+        self._pending: dict[str, asyncio.Future] = {}
+        orig = wa.on_poll_update
+
+        async def _h(pid, tally):
+            if pid in self._pending and not self._pending[pid].done():
+                _yes = _C["approval"]["yes_keyword"]
+                self._pending[pid].set_result(any(_yes in o.lower() for o in tally if tally[o]))
+            if orig:
+                await orig(pid, tally)
+
+        wa.on_poll_update = _h
+
+    async def request_approval(self, question: str, host_jid: str, detail: str = "") -> bool:
+        if detail:
+            await self._wa.send(host_jid, detail)
+        pid = await self._wa.send_poll(host_jid, question, _C["approval"]["options"])
+        self._pending[pid] = asyncio.get_running_loop().create_future()
+        try:
+            return await asyncio.wait_for(self._pending[pid], timeout=self._timeout)
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            self._pending.pop(pid, None)
+
+
 class ChannelCore:
-    def __init__(self, wa, ctrl, session, engine, notify, plugin_dir=".", plugin_proxies=None, notify_queue=None):
-        self._wa = wa; self._ctrl = ctrl; self._session = session; self._engine = engine
-        self._notify = notify; self._base = Path(plugin_dir)
-        self._plugin_proxies = plugin_proxies or {}; self._notify_queue = notify_queue
+    def __init__(
+        self,
+        wa,
+        ctrl,
+        engine,
+        notify,
+        agent_dir=".",
+        app_proxies=None,
+        notify_queue=None,
+        allowed_tools=None,
+        allowed_resources=None,
+    ):
+        self._wa = wa
+        self._ctrl = ctrl
+        self._engine = engine
+        self._notify = notify
+        self._base = Path(agent_dir)
+        self._app_proxies = app_proxies or {}
+        self._notify_queue = notify_queue
+        self._allowed_tools: set[str] | None = allowed_tools
+        self._allowed_resources: list[str] | None = allowed_resources
+        self._catchup_buffer: list[Message] = []
+        self._approval = AdapterApprovalEngine(wa, ctrl, timeout=_cfg.test_message_timeout)
+        self._pending_elevations: set[str] = set()
+        engine.on_catchup = self._flush_catchup
+
+    def _check_memory_access(self, a: dict) -> list[TextContent] | None:
+        if self._allowed_resources is None:
+            return None
+        from fnmatch import fnmatch
+
+        app_filter = a.get("app") or a.get("entity", {}).get("app", "")
+        if not app_filter:
+            return _R(_MSG["error_memory_denied"].format(app="(all)"))
+        uri = f"c3://memory/{app_filter}"
+        if not any(
+            fnmatch(uri, p) or fnmatch(uri + "/", p) or fnmatch(uri + "/*", p)
+            for p in self._allowed_resources
+        ):
+            return _R(_MSG["error_memory_denied"].format(app=app_filter))
+        return None
+
     async def call_tool(self, name: str, arguments: dict) -> list[TextContent]:
-        a = arguments or {}; log("tool", f"{name} {json.dumps(a)[:_cfg.log_truncate]}")
-        # ── Messaging ────────────────────────────────────────────────────────
-        if name in ("reply", "send_private"):
-            jid = self._ctrl.jid_mask.unmask(pick(a, "jid", "to", "recipient") or "host")
-            text = pick(a, "text", "message", "content") or ""; await self._wa.send(jid, text)
-            return [TextContent(type="text", text="sent")]
-        if name == "send_poll":
-            options = a.get("options", [])
-            if isinstance(options, str):
-                try: options = json.loads(options)
-                except (ValueError, json.JSONDecodeError): options = []
-            if len(options) < 2: return [TextContent(type="text", text="Error: options must be array ≥2")]
-            group_jid = self._ctrl.jid_mask.unmask(pick(a, "group_jid", "jid", "to") or "group")
-            if not group_jid.endswith("@g.us"): return [TextContent(type="text", text="Error: group not resolved")]
-            poll_id = await self._wa.send_poll(group_jid, a["question"], options)
-            self._engine.track_poll(poll_id, group_jid, a["question"])
-            return [TextContent(type="text", text=f"poll: {poll_id}")]
-        # ── Groups ───────────────────────────────────────────────────────────
-        if name == "get_group_members":
-            group_jid = self._ctrl.jid_mask.unmask(pick(a, "group_jid", "jid") or "group")
-            if not group_jid.endswith("@g.us"): return [TextContent(type="text", text="Error: group not resolved")]
-            members = await self._wa.get_group_members(group_jid)
-            return [TextContent(type="text", text="\n".join(f'{m.name}{" (admin)" if m.is_admin else ""}' for m in members) or "No members")]
-        if name == "resolve_group":
-            link = pick(a, "invite_link", "link") or ""
-            if not link or "chat.whatsapp.com" not in link:
-                return [TextContent(type="text", text="Error: provide a valid WhatsApp invite link")]
-            try: group_jid = await self._wa.resolve_group(link)
-            except Exception as e: return [TextContent(type="text", text=f"Error: {e}")]
-            members = await self._wa.get_group_members(group_jid)
-            self._session.grant("session_group", [{"jid": group_jid, "token": "group"}])
-            if members:
-                entries = [{"jid": m.jid, "token": m.name} for m in members]
-                for m in members:
-                    if m.lid: entries.append({"jid": m.lid, "token": m.name})
-                self._session.grant("session_participants", entries)
-            self._engine.set_active(group_jid, "session")
-            log("c3", f"resolved group: {group_jid} ({len(members)} members)")
-            member_list = "\n".join(f'{m.name}{" (admin)" if m.is_admin else ""}' for m in members) or "No members"
-            return [TextContent(type="text", text=f"GROUP: group\nMEMBERS ({len(members)}):\n{member_list}")]
-        # ── Session ──────────────────────────────────────────────────────────
-        if name == "set_timer":
-            seconds = parse_duration(pick(a, "seconds", "duration", "time"), _cfg.default_phase_timer)
-            timer_name = pick(a, "name", "phase_name", "phase") or "timer"
-            group_jid = self._engine.resolve_group(pick(a, "group_jid", "jid", "group"))
-            if not group_jid: return [TextContent(type="text", text="Error: no active session")]
-            self._engine.set_phase_timer(group_jid, seconds, timer_name)
-            return [TextContent(type="text", text=f"timer: {timer_name} ({seconds}s)")]
-        if name == "end_session":
-            group_jid = pick(a, "group_jid", "jid")
-            if group_jid: group_jid = self._ctrl.jid_mask.unmask(group_jid)
-            self._engine.clear_all_timers(); self._engine.clear_active(group_jid)
-            self._session.revoke("session_participants"); self._session.revoke("session_group")
-            return [TextContent(type="text", text="session ended")]
-        # ── Memory ───────────────────────────────────────────────────────────
-        if name == "memory_write":
-            entity = a.get("entity") or {}
-            if not entity: return [TextContent(type="text", text="Error: entity required")]
-            if "plugin" not in entity or "entity" not in entity:
-                return [TextContent(type="text", text="Error: entity must include 'plugin' and 'entity' fields")]
-            pk = [k for k in ("plugin", "entity", "name") if k in entity]
-            _mem(self._base)["entities"].upsert(entity, pk)
-            return [TextContent(type="text", text="ok")]
-        if name == "memory_read":
-            kwargs = {k: a[k] for k in ("plugin", "entity_type") if a.get(k)}
-            if "entity_type" in kwargs: kwargs["entity"] = kwargs.pop("entity_type")
-            rows = list(_mem(self._base)["entities"].find(**kwargs))
-            return [TextContent(type="text", text=json.dumps(rows, indent=2))]
-        if name == "memory_search":
-            q = (a.get("query") or "").strip()
-            if not q: return [TextContent(type="text", text="[]")]
-            db = _mem(self._base)
+        a = arguments or {}
+        if name == "send_private":
+            name = "reply"
+        log(LOG_TOOL, f"{name} {json.dumps(a)[: _cfg.log_truncate]}")
+        if self._allowed_tools is not None and name not in self._allowed_tools:
+            log(LOG_POLICY, f"blocked tool: {name} (not in allowed_tools)")
+            return _R(_MSG["error_tool_not_allowed"].format(name=name))
+        if name in ("memory_read", "memory_search", "memory_write", "memory_delete"):
+            err = self._check_memory_access(a)
+            if err:
+                return err
+        if name in _MEDIA_DISPATCH:
+            return await self._tool_send_media(name, a)
+        handler = getattr(self, f"_tool_{name}", None)
+        if not handler:
+            return _R(_MSG["error_unknown_tool"].format(name=name))
+        return await handler(a)
+
+    async def _send_with_approval(self, jid: str, text: str) -> list[TextContent]:
+        if self._ctrl.is_host(jid) or self._wa.is_group_id(jid) or self._ctrl.is_elevated(jid):
+            await self._wa.send(jid, text)
+            return _R("sent")
+        if not self._ctrl.is_participant(jid):
+            return _R(_MSG["error_not_in_session"])
+        token = self._ctrl.mask(jid)
+        host_jid = self._ctrl.unmask("host")
+        pl = _cfg.dm_preview_length
+        preview = text[:pl] + ("..." if len(text) > pl else "")
+        if await self._approval.request_approval(
+            _MSG["approval_dm_question"].format(token=token),
+            host_jid,
+            _MSG["approval_dm_detail"].format(token=token, preview=preview),
+        ):
+            await self._wa.send(jid, text)
+            self._ctrl.grant_jid(ROLE_ELEVATED, jid)
+            return _R("sent")
+        return _R(_MSG["denied_dm"].format(token=token))
+
+    async def _tool_reply(self, a: dict) -> list[TextContent]:
+        jid = self._ctrl.unmask(pick(a, "jid", "to", "recipient") or TOKEN_HOST)
+        text = pick(a, "text", "message", "content") or ""
+        if not text.strip():
+            return _R("Error: text required")
+        return await self._send_with_approval(jid, text)
+
+    async def _tool_send_poll(self, a: dict) -> list[TextContent]:
+        question = a.get("question", "")
+        if not question:
+            return _R(_MSG["error_question_required"])
+        options = a.get("options", [])
+        if isinstance(options, str):
             try:
-                table = db["entities"]
-                cols = [c for c in table.columns if c != "id"]
-                where = " OR ".join(f'CAST("{c}" AS TEXT) LIKE :q' for c in cols)
-                rows = list(db.query(f"SELECT * FROM entities WHERE {where}", q=f"%{q}%"))
-            except Exception:
-                rows = [r for r in db["entities"].all() if q.lower() in json.dumps(r).lower()]
-            return [TextContent(type="text", text=json.dumps(rows, indent=2))]
-        if name == "memory_delete":
-            kwargs = {k: a[k] for k in ("plugin", "entity_type", "name") if a.get(k)}
-            if "entity_type" in kwargs: kwargs["entity"] = kwargs.pop("entity_type")
-            _mem(self._base)["entities"].delete(**kwargs)
-            return [TextContent(type="text", text="ok")]
-        # ── Plugins ──────────────────────────────────────────────────────────
-        if name == "load_plugin":
-            pname = (a.get("name") or "").strip().lower().removesuffix(".md")
-            if not pname: return [TextContent(type="text", text="Error: name required")]
-            skills = find_plugin_content(pname, self._base)
-            if not skills: return [TextContent(type="text", text=f"Error: plugin '{pname}' not found")]
-            msgs: list[str] = []
-            for skill_name, content in skills: await self._notify(content, {"type": "skill_load", "skill": skill_name})
-            msgs.append(f"Skills loaded: {', '.join(s for s, _ in skills)}")
-            if pname not in self._plugin_proxies:
-                for root in [self._base, Path(__file__).parent / "plugins"]:
-                    mcp_file = root / pname / ".mcp"
-                    if mcp_file.exists():
-                        try:
-                            params = json.loads(mcp_file.read_text())
-                            proxy = PluginMCPProxy(pname, params, self._base)
-                            self._plugin_proxies[pname] = proxy; asyncio.ensure_future(proxy.run())
-                            try:
-                                await asyncio.wait_for(proxy._ready.wait(), timeout=_cfg.plugin_init_timeout)
-                                msgs.append(f"MCP server: {len(proxy.tools)} tools added")
-                            except asyncio.TimeoutError: msgs.append("MCP server starting...")
-                            if self._notify_queue: await self._notify_queue.put(("", {"_tools_changed": True}))
-                        except Exception as e: log("plugin", f"failed to load MCP for '{pname}': {e}")
-                        break
-            return [TextContent(type="text", text="\n".join(msgs))]
-        # ── Files ────────────────────────────────────────────────────────────
-        if name == "save_file":
-            rel_path = pick(a, "path", "filename") or ""
-            if not rel_path: return [TextContent(type="text", text="Error: path required")]
-            target = (self._base / rel_path).resolve()
-            if not str(target).startswith(str(self._base.resolve())):
-                return [TextContent(type="text", text="Error: path must be within plugin directory")]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(a.get("content", ""))
-            return [TextContent(type="text", text=f"saved: {rel_path}")]
-        raise ValueError(f"Unknown tool: {name}")
-    async def on_message(self, msg: WAMessage) -> None:
-        log("msg", f"from={msg.push_name} jid={msg.sender} group={msg.is_group} text={msg.text[:80]}")
+                options = json.loads(options)
+            except (ValueError, json.JSONDecodeError):
+                options = []
+        if not isinstance(options, list) or len(options) < 2:
+            return _R(_MSG["error_options_invalid"])
+        group_jid = self._ctrl.unmask(pick(a, "group_jid", "jid", "to") or TOKEN_GROUP)
+        if not self._wa.is_group_id(group_jid):
+            return _R(_MSG["error_group_not_resolved"])
+        poll_id = await self._wa.send_poll(group_jid, question, options)
+        self._engine.track_poll(poll_id, group_jid, a["question"])
+        return _R(f"poll: {poll_id}")
+
+    async def _tool_send_media(self, name: str, a: dict) -> list[TextContent]:
+        jid = self._ctrl.unmask(pick(a, "jid", "to") or TOKEN_HOST)
+        path = a.get("path") or ""
+        if not path:
+            return _R(_MSG["error_path_required"])
+        if not Path(path).exists():
+            return _R(_MSG["error_file_not_found"].format(path=path))
+        method_name, keys = _MEDIA_DISPATCH[name]
+        defaults = _C["media_defaults"]
+        try:
+            kwargs = {k: a.get(k, defaults.get(k, "")) for k in keys}
+            # Bug #27: coerce ptt to bool
+            if "ptt" in kwargs:
+                kwargs["ptt"] = str(kwargs["ptt"]).lower() in ("true", "1", "yes")
+            await getattr(self._wa, method_name)(jid, path, **kwargs)
+        except NotImplementedError:
+            return _R(_MSG["error_media_not_supported"])
+        return _R("sent")
+
+    async def _tool_react(self, a: dict) -> list[TextContent]:
+        jid = self._ctrl.unmask(pick(a, "jid", "to") or TOKEN_HOST)
+        mid = a.get("message_id") or ""
+        emoji = a.get("emoji") or "👍"
+        if not mid:
+            return _R(_MSG["error_message_id_required"])
+        try:
+            await self._wa.react(jid, mid, emoji)
+        except NotImplementedError:
+            return _R(_MSG["error_reactions_not_supported"])
+        return _R("reacted")
+
+    async def _tool_get_group_members(self, a: dict) -> list[TextContent]:
+        group_jid = self._ctrl.unmask(pick(a, "group_jid", "jid") or TOKEN_GROUP)
+        if not self._wa.is_group_id(group_jid):
+            return _R(_MSG["error_group_not_resolved"])
+        members = await self._wa.get_group_members(group_jid)
+        return _R(
+            "\n".join(f"{m.name}{' (admin)' if m.is_admin else ''}" for m in members)
+            or "No members"
+        )
+
+    async def _tool_resolve_group(self, a: dict) -> list[TextContent]:
+        link = pick(a, "invite_link", "link") or ""
+        if not link or not self._wa.is_valid_invite(link):
+            return _R(_MSG["error_invalid_invite"])
+        try:
+            group_jid = await self._wa.resolve_group(link)
+        except Exception as e:
+            return _R(f"Error: {e}")
+        members = await self._wa.get_group_members(group_jid)
+        self._ctrl.grant(ROLE_GROUP, [{"jid": group_jid, "token": "group"}])
+        if members:
+            entries = [
+                e
+                for m in members
+                for e in [{"jid": m.jid, "token": m.name}]
+                + ([{"jid": m.lid, "token": m.name}] if m.lid else [])
+            ]
+            self._ctrl.grant(ROLE_PARTICIPANTS, entries)
+        self._engine.set_active(group_jid, "session")
+        log(LOG_C3, f"resolved group: {group_jid} ({len(members)} members)")
+        ml = (
+            "\n".join(f"{m.name}{' (admin)' if m.is_admin else ''}" for m in members)
+            or "No members"
+        )
+        return _R(f"GROUP: group\nMEMBERS ({len(members)}):\n{ml}")
+
+    async def _tool_set_timer(self, a: dict) -> list[TextContent]:
+        seconds = parse_duration(pick(a, "seconds", "duration", "time"), _cfg.default_phase_timer)
+        timer_name = pick(a, "name", "phase_name", "phase") or "timer"
+        group_jid = self._engine.resolve_group(pick(a, "group_jid", "jid", "group"))
+        if not group_jid:
+            return _R(_MSG["error_no_active_session"])
+        self._engine.set_phase_timer(group_jid, seconds, timer_name)
+        return _R(f"timer: {timer_name} ({seconds}s)")
+
+    async def _tool_end_session(self, a: dict) -> list[TextContent]:
+        group_jid = pick(a, "group_jid", "jid")
+        if group_jid:
+            group_jid = self._ctrl.unmask(group_jid)
+        self._engine.clear_all_timers()
+        self._engine.clear_active(group_jid)
+        self._ctrl.revoke(ROLE_PARTICIPANTS)
+        self._ctrl.revoke(ROLE_GROUP)
+        self._ctrl.revoke(ROLE_ELEVATED)
+        self._pending_elevations.clear()
+        return _R("session ended")
+
+    async def _tool_memory_write(self, a: dict) -> list[TextContent]:
+        entity = a.get("entity") or {}
+        if not entity:
+            return _R(_MSG["error_entity_required"])
+        if not all(k in entity for k in ("app", "entity", "name")):
+            return _R(_MSG["error_entity_fields"])
+        # Bug #76: validate entity keys against known schema fields
+        entity = {k: v for k, v in entity.items() if k in ENTITY_KEYS}
+        _mem(self._base)["entities"].upsert(entity, ["app", "entity", "name"])
+        return _R("ok")
+
+    async def _tool_memory_read(self, a: dict) -> list[TextContent]:
+        kwargs = {k: a[k] for k in ("app", "entity_type") if a.get(k)}
+        if "entity_type" in kwargs:
+            kwargs["entity"] = kwargs.pop("entity_type")
+        return _R(json.dumps(list(_mem(self._base)["entities"].find(**kwargs)), indent=2))
+
+    async def _tool_memory_search(self, a: dict) -> list[TextContent]:
+        q = (a.get("query") or "").strip()
+        if not q:
+            return _R("[]")
+        db = _mem(self._base)
+        try:
+            table = db["entities"]
+            cols = [c for c in table.columns if c != "id"]
+            # Bug #29: escape LIKE wildcards
+            esc = "\\"
+            q_escaped = q.replace("%", esc + "%").replace("_", esc + "_")
+            where = " OR ".join(f'CAST("{c}" AS TEXT) LIKE :q ESCAPE :esc' for c in cols)
+            rows = list(
+                db.query(f"SELECT * FROM entities WHERE {where}", q=f"%{q_escaped}%", esc=esc)
+            )
+        except Exception:
+            rows = [r for r in db["entities"].all() if q.lower() in json.dumps(r).lower()]
+        return _R(json.dumps(rows, indent=2))
+
+    async def _tool_memory_delete(self, a: dict) -> list[TextContent]:
+        kwargs = {k: a[k] for k in ("app", "entity_type", "name") if a.get(k)}
+        if "entity_type" in kwargs:
+            kwargs["entity"] = kwargs.pop("entity_type")
+        if not kwargs:
+            return _R(_MSG["error_delete_filter_required"])
+        _mem(self._base)["entities"].delete(**kwargs)
+        return _R("ok")
+
+    async def _tool_load_app(self, a: dict) -> list[TextContent]:
+        pname = (a.get("name") or "").strip().lower().removesuffix(".md")
+        if not pname:
+            return _R(_MSG["error_name_required"])
+        skills = find_app_content(pname, self._base)
+        if not skills:
+            return _R(_MSG["error_app_not_found"].format(name=pname))
+        for sn, content in skills:
+            await self._notify(content, {"type": EVT_SKILL_LOAD, "skill": sn})
+        msgs = [f"Skills loaded: {', '.join(s for s, _ in skills)}"]
+        if pname not in self._app_proxies:
+            mcp_file = next(
+                (
+                    root / pname / ".mcp"
+                    for root in [self._base, _PKG / DIR_APPS]
+                    if (root / pname / ".mcp").exists()
+                ),
+                None,
+            )
+            if mcp_file:
+                try:
+                    proxy = AppMCPProxy(pname, json.loads(mcp_file.read_text()), self._base)
+                    self._app_proxies[pname] = proxy
+                    asyncio.ensure_future(proxy.run())
+                    try:
+                        await asyncio.wait_for(proxy._ready.wait(), timeout=_cfg.app_init_timeout)
+                        msgs.append(f"MCP server: {len(proxy.tools)} tools added")
+                    except asyncio.TimeoutError:
+                        msgs.append("MCP server starting...")
+                    if self._notify_queue:
+                        await self._notify_queue.put(("", {EVT_TOOLS_CHANGED: True}))
+                except Exception as e:
+                    log(LOG_APP, f"failed to load MCP for '{pname}': {e}")
+        return _R("\n".join(msgs))
+
+    _tool_load_agent = _tool_load_app
+
+    async def _tool_save_file(self, a: dict) -> list[TextContent]:
+        rel_path = pick(a, "path", "filename") or ""
+        if not rel_path:
+            return _R(_MSG["error_path_required"])
+        target = (self._base / rel_path).resolve()
+        base_r = self._base.resolve()
+        # Bug fix #1: string prefix check allows /app_evil to pass /app
+        # Bug fix #5: resolve symlinks to prevent symlink bypass
+        try:
+            target.relative_to(base_r)
+        except ValueError:
+            return _R(_MSG["error_path_outside"])
+        content = a.get("content", "")
+        if len(content) > 1_000_000:
+            return _R("Error: content too large (max 1MB)")
+        # Block overwriting critical config files
+        _protected = PROTECTED_FILES
+        if target.name in _protected:
+            return _R(f"Error: cannot overwrite protected file: {target.name}")
+        if target.suffix == ".md":
+            with contextlib.suppress(ValueError):
+                p = target.relative_to(base_r).parts
+                if len(p) >= 2 and (self._base / p[0] / FILE_APP_JSON).exists():
+                    if not (
+                        (len(p) == 2 and p[1] == FILE_CLAUDE_MD)
+                        or (len(p) == 3 and p[1] == DIR_SKILLS)
+                    ):
+                        return _R(_MSG["error_md_restricted"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        return _R(f"saved: {rel_path}")
+
+    async def _flush_catchup(self) -> None:
+        host = self._ctrl.unmask("host")
+        if not self._catchup_buffer:
+            await self._wa.send(host, _MSG["catchup_empty"])
+            return
+        msgs, self._catchup_buffer = self._catchup_buffer, []
+        n = len(msgs)
+        tl = _cfg.catchup_text_length
+        body = _MSG["catchup_header"].format(count=n) + "\n".join(
+            f"  [{self._ctrl.mask(m.sender) if self._ctrl.is_known(m.sender) else m.push_name}]"
+            f"{f' [{m.media_type}]' if m.media_type else ''} {m.text[:tl]}"
+            for m in msgs
+        )
+        await self._notify(body, {"type": "catchup", "count": str(n)})
+        await self._wa.send(host, _MSG["catchup_confirm"].format(count=n))
+        log("catchup", f"flushed {n}")
+
+    async def on_message(self, msg: Message) -> None:
+        tag = "catchup" if msg.catchup else "msg"
+        log(
+            tag,
+            f"from={msg.push_name} jid={msg.sender} group={msg.is_group} text={msg.text[: _cfg.log_text_length]}",
+        )
+        if msg.catchup:
+            self._catchup_buffer.append(msg)
+            return
         if not self._ctrl.can_reach(msg.sender, msg.is_group, msg.text):
-            # Auto-admit: if message is from a group with an active session, grant the sender
-            if msg.is_group and self._ctrl._has_role(msg.jid, "session_group"):
-                name = msg.push_name or msg.sender.split("@")[0]
-                self._ctrl._dynamics.setdefault("session_participants", set()).add(msg.sender)
-                self._ctrl.jid_mask.register(msg.sender, name)
-                log("policy", f"auto-admitted: {name} ({msg.sender})")
+            if msg.is_group and self._ctrl.has_role(msg.jid, ROLE_GROUP):
+                name = msg.push_name or self._wa.extract_name(msg.sender)
+                self._ctrl.grant_jid(ROLE_PARTICIPANTS, msg.sender)
+                self._ctrl.register(msg.sender, name)
+                log(LOG_POLICY, f"auto-admitted: {name} ({msg.sender})")
+            elif not msg.is_group and self._ctrl.is_elevated(msg.sender):
+                log(LOG_POLICY, f"elevated participant DM: {msg.push_name}")
+            elif not msg.is_group and self._ctrl.is_participant(msg.sender):
+                if msg.sender not in self._pending_elevations:
+                    self._pending_elevations.add(msg.sender)
+                    name = msg.push_name or self._wa.extract_name(msg.sender)
+                    host_jid = self._ctrl.unmask("host")
+                    approved = await self._approval.request_approval(
+                        _MSG["approval_elevation_question"].format(name=name),
+                        host_jid,
+                        _MSG["approval_elevation_detail"].format(name=name),
+                    )
+                    self._pending_elevations.discard(msg.sender)
+                    if approved:
+                        self._ctrl.grant_jid(ROLE_ELEVATED, msg.sender)
+                        log(LOG_POLICY, f"elevated: {msg.sender}")
+                return
             else:
-                log("policy", f"dropped: {msg.sender}"); return
-        if await self._engine.handle(msg): return
-        # Sanitize: strip XML-like tags and prompt format markers that could blend with MCP envelope
-        sanitized = re.sub(r'</?(?:channel|system|human|assistant|tool)[^>]*>', '', msg.text)
-        sanitized = re.sub(r'\n\n(Human|Assistant|System):', r'\n\n[\1]:', sanitized)
-        await self._notify(self._ctrl.jid_mask.mask(sanitized),
-            {"type": "message", "jid": self._ctrl.jid_mask.mask(msg.jid),
-             "sender": self._ctrl.jid_mask.mask(msg.sender), "name": msg.push_name or "",
-             **( {"group": "true"} if msg.is_group else {})})
+                log(LOG_POLICY, f"dropped: {msg.sender}")
+                return
+        if await self._engine.handle(msg):
+            return
+        _san = _C["sanitize"]
+        sanitized = re.sub(
+            _san["injection_regex"],
+            _san["injection_replace"],
+            re.sub(_san["tag_regex"], "", msg.text),
+        )
+        is_host = self._ctrl.has_role(msg.sender, ROLE_HOSTS)
+        role_tag = "host" if is_host else "participant"
+        meta: dict = {
+            "type": EVT_MESSAGE,
+            "jid": self._ctrl.mask(msg.jid),
+            "sender": self._ctrl.mask(msg.sender),
+            "name": msg.push_name or "",
+            "role": role_tag,
+        }
+        if msg.is_group:
+            meta["group"] = "true"
+        if msg.is_group and not is_host:
+            meta["read_only"] = "true"
+        if msg.media_path:
+            meta.update(
+                {
+                    "media_path": msg.media_path,
+                    "media_type": msg.media_type or "",
+                    **{
+                        k: str(v)
+                        for k, v in {
+                            "media_mimetype": msg.media_mimetype,
+                            "media_size": msg.media_size,
+                            "media_duration": msg.media_duration,
+                            "media_filename": msg.media_filename,
+                        }.items()
+                        if v is not None
+                    },
+                }
+            )
+        await self._notify(
+            f"[{role_tag}] {self._ctrl.mask(msg.sender)}: {self._ctrl.mask(sanitized)}", meta
+        )
 
-_DEFAULT_MANIFEST = PluginManifest(name="c3", access=AccessPolicy(
-    commands={"/start": ["hosts", "admins"], "/stop": ["hosts", "admins"], "/status": ["hosts", "admins"], "/plugin": ["hosts", "admins"]},
-    dm=["hosts", "admins"], group=[]))
 
-def _merge_manifests(extras: list[dict]) -> PluginManifest:
-    dm: set[str] = set(); group: set[str] = set(); commands: dict[str, set[str]] = {}
+_dm = _C["manifest"]
+_DEFAULT_MANIFEST = AppManifest(name=_dm["name"], access=AccessPolicy(**_dm["access"]))
+
+
+def _merge_manifests(extras: list[dict]) -> AppManifest:
+    dm: set[str] = set()
+    group: set[str] = set()
+    commands: dict[str, set[str]] = {}
     for m in [_DEFAULT_MANIFEST, *extras]:
-        access = m.access if isinstance(m, PluginManifest) else AccessPolicy(**{
-            "commands": m.get("access", {}).get("commands", {}),
-            "dm": m.get("access", {}).get("dm", []), "group": m.get("access", {}).get("group", [])})
-        dm.update(access.dm); group.update(access.group)
-        for cmd, roles in access.commands.items(): commands.setdefault(cmd, set()).update(roles)
-    names = [(m.name if isinstance(m, PluginManifest) else m.get("name", "")) for m in extras]
-    return PluginManifest(name="+".join(n for n in names if n) or "c3",
-        access=AccessPolicy(dm=list(dm), group=list(group), commands={k: list(v) for k, v in commands.items()}))
+        access = (
+            m.access
+            if isinstance(m, AppManifest)
+            else AccessPolicy(
+                **{
+                    "commands": m.get("access", {}).get("commands", {}),
+                    "dm": m.get("access", {}).get("dm", []),
+                    "group": m.get("access", {}).get("group", []),
+                }
+            )
+        )
+        dm.update(access.dm)
+        group.update(access.group)
+        for cmd, roles in access.commands.items():
+            commands.setdefault(cmd, set()).update(roles)
+    names = [(m.name if isinstance(m, AppManifest) else m.get("name", "")) for m in extras]
+    return AppManifest(
+        name="+".join(n for n in names if n) or "c3",
+        access=AccessPolicy(
+            dm=list(dm), group=list(group), commands={k: list(v) for k, v in commands.items()}
+        ),
+    )
 
-_BRIDGE = Path(__file__).parent / "baileys_bridge.js"
 
-class BaileysAdapter(WAAdapter):
+_BRIDGE_APP = Path("/app/c3/baileys_bridge.js")
+_BRIDGE = _BRIDGE_APP if _BRIDGE_APP.exists() else _PKG / "baileys_bridge.js"
+
+_MEDIA_FIELD_MAP = {
+    "media_path": "mediaPath",
+    "media_type": "mediaType",
+    "media_mimetype": "mediaMimetype",
+    "media_size": "mediaSize",
+    "media_duration": "mediaDuration",
+    "media_filename": "mediaFileName",
+}
+
+
+class BaileysAdapter(ChatAdapter):
     def __init__(self, bridge: str | None = None, sessions_dir: str | None = None):
-        self._bridge = bridge or str(_BRIDGE); self._sessions = sessions_dir
+        self._bridge = bridge or str(_BRIDGE)
+        self._sessions = sessions_dir
         self._proc: asyncio.subprocess.Process | None = None
-        self._pending: dict[int, asyncio.Future] = {}; self._bg_tasks: set[asyncio.Task] = set()
-        self._next_id = 1; self.admin_jid = ""
+        self._pending: dict[int, asyncio.Future] = {}
+        self._bg_tasks: set[asyncio.Task] = set()
+        self._next_id = 1
+        self.admin_jid = ""
+        self._env: dict = {}
+        self._cwd = ""
+        self._bridge_restarts = 0
+        self._shutting_down = False
+        self._bridge_stderr = None
+
+    def _bg(self, coro):
+        t = asyncio.ensure_future(coro)
+        self._bg_tasks.add(t)
+
+        def _done(task):
+            self._bg_tasks.discard(task)
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc:
+                log(LOG_BAILEYS, f"background task error: {exc}")
+
+        t.add_done_callback(_done)
+
     async def connect(self) -> None:
-        bridge_dir = Path(self._bridge).parent; await self._ensure_node_modules(bridge_dir)
-        env = {**os.environ}
-        if self._sessions: env["SESSIONS_DIR"] = self._sessions
-        self._proc = await asyncio.create_subprocess_exec("node", self._bridge,
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=sys.stderr, env=env)
-        log("baileys", f"bridge started (pid={self._proc.pid})")
-        self._read_task = asyncio.ensure_future(self._read_events())
-        ready = asyncio.get_running_loop().create_future(); orig_ready = self.on_ready
-        async def _on_ready() -> None:
-            if not ready.done(): ready.set_result(None)
-            if orig_ready: await orig_ready()
-        self.on_ready = _on_ready; await asyncio.wait_for(ready, timeout=_cfg.bridge_connect_timeout)
-    async def send(self, jid: str, text: str) -> None: await self._cmd(cmd="send", jid=jid, text=text)
+        bd = Path(self._bridge).parent
+        await self._ensure_node_modules(bd)
+        # Bug #37: whitelist env vars for bridge process
+        _safe_keys = {"PATH", "HOME", "NODE_PATH", "NODE_ENV", "LANG", "TERM"}
+        self._env = {k: v for k, v in os.environ.items() if k in _safe_keys}
+        if self._sessions:
+            self._env["SESSIONS_DIR"] = self._sessions
+        self._cwd = str(
+            next((c for c in [bd, bd.parent, Path("/app")] if (c / "node_modules").is_dir()), bd)
+        )
+        await self._start_bridge()
+
+    async def _start_bridge(self) -> None:
+        if self._bridge_stderr:
+            with contextlib.suppress(Exception):
+                self._bridge_stderr.close()
+        bl = Path(self._env.get("SESSIONS_DIR", ".")) / ".." / DIR_LOGS / "bridge.log"
+        bl.parent.mkdir(parents=True, exist_ok=True)
+        self._bridge_stderr = open(bl, "ab")
+        self._proc = await asyncio.create_subprocess_exec(
+            "node",
+            self._bridge,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=self._bridge_stderr,
+            env=self._env,
+            cwd=self._cwd,
+        )
+        log(LOG_BAILEYS, f"bridge started (pid={self._proc.pid})")
+        asyncio.ensure_future(self._read_events())
+        asyncio.ensure_future(self._watch_and_restart())
+        ready = asyncio.get_running_loop().create_future()
+        # Bug #41: store original callback once, don't nest wrappers
+        if not hasattr(self, "_orig_on_ready"):
+            self._orig_on_ready = self.on_ready
+
+        async def _on_ready():
+            if not ready.done():
+                ready.set_result(None)
+            if self._orig_on_ready:
+                await self._orig_on_ready()
+
+        self.on_ready = _on_ready
+        await asyncio.wait_for(ready, timeout=_cfg.bridge_connect_timeout)
+        self._bridge_restarts = 0
+
+    async def _watch_and_restart(self) -> None:
+        if not self._proc:
+            return
+        await self._proc.wait()
+        if self._shutting_down or self._bridge_restarts >= _C["bridge"]["max_restarts"]:
+            return
+        delay = _C["bridge"]["backoff_base"] * (2**self._bridge_restarts)
+        self._bridge_restarts += 1
+        log(LOG_BAILEYS, f"restarting in {delay}s (attempt {self._bridge_restarts})")
+        await asyncio.sleep(delay)
+        try:
+            await self._start_bridge()
+        except Exception as e:
+            log(LOG_BAILEYS, f"restart failed: {e}")
+
+    async def send(self, jid: str, text: str) -> None:
+        await self._cmd(cmd="send", jid=jid, text=text)
+
     async def send_poll(self, jid: str, question: str, options: list[str]) -> str:
         return str(await self._cmd(cmd="sendPoll", jid=jid, question=question, options=options))
+
     async def resolve_group(self, invite_link: str) -> str:
         return str(await self._cmd(cmd="resolveGroup", link=invite_link))
+
     async def get_group_members(self, group_jid: str) -> list[GroupMember]:
         result = await self._cmd(cmd="getGroupMembers", groupJid=group_jid)
-        return [GroupMember(jid=m["jid"], name=m["name"], is_admin=m["isAdmin"], lid=m.get("lid")) for m in (result or [])]
-    def get_name(self, jid: str) -> str: return jid.split("@")[0]
+        return [
+            GroupMember(jid=m["jid"], name=m["name"], is_admin=m["isAdmin"], lid=m.get("lid"))
+            for m in (result or [])
+        ]
+
+    async def react(self, jid: str, message_id: str, emoji: str) -> None:
+        await self._cmd(cmd="sendReaction", jid=jid, messageId=message_id, emoji=emoji)
+
+    async def send_presence(self, jid: str, presence: str = "composing") -> None:
+        await self._cmd(cmd="sendPresence", jid=jid, presence=presence)
+
+    async def send_image(self, jid: str, path: str, caption: str = "") -> None:
+        await self._cmd(cmd="sendImage", jid=jid, path=path, caption=caption)
+
+    async def send_video(self, jid: str, path: str, caption: str = "") -> None:
+        await self._cmd(cmd="sendVideo", jid=jid, path=path, caption=caption)
+
+    async def send_audio(self, jid: str, path: str, ptt: bool = False) -> None:
+        await self._cmd(cmd="sendAudio", jid=jid, path=path, ptt=ptt)
+
+    async def send_document(
+        self, jid: str, path: str, filename: str = "", mimetype: str = ""
+    ) -> None:
+        await self._cmd(
+            cmd="sendDocument", jid=jid, path=path, fileName=filename, mimetype=mimetype
+        )
+
+    def get_name(self, jid: str) -> str:
+        return jid.split("@")[0]
+
+    def is_group_id(self, id: str) -> bool:
+        return id.endswith("@g.us")
+
+    def is_valid_invite(self, link: str) -> bool:
+        from urllib.parse import urlparse
+
+        try:
+            h = urlparse(link).hostname or ""
+            return h == "chat.whatsapp.com" or h.endswith(".chat.whatsapp.com")
+        except Exception:
+            return False
+
+    def extract_name(self, id: str) -> str:
+        return id.split("@")[0]
+
     @staticmethod
     async def _ensure_node_modules(bridge_dir: Path) -> None:
-        install_dir = bridge_dir
-        for d in [bridge_dir, *bridge_dir.parents]:
-            if (d / "package.json").exists(): install_dir = d; break
-        if (install_dir / "node_modules").exists() or not (install_dir / "package.json").exists(): return
-        log("baileys", f"installing node deps in {install_dir} (first run)...")
-        proc = await asyncio.create_subprocess_exec("npm", "install", "--production", "--ignore-scripts", "--silent",
-            cwd=str(install_dir), stderr=sys.stderr)
-        if await proc.wait() != 0: raise RuntimeError("npm install failed — is Node.js installed?")
-        log("baileys", "node dependencies installed")
-    async def _cmd(self, **kwargs) -> object:
-        if not self._proc or not self._proc.stdin: raise RuntimeError("bridge not connected")
-        cmd_id = self._next_id; self._next_id += 1
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[cmd_id] = fut
-        payload = json.dumps({"id": cmd_id, **kwargs}) + "\n"
-        self._proc.stdin.write(payload.encode()); await self._proc.stdin.drain()
-        return await asyncio.wait_for(fut, timeout=_cfg.baileys_cmd_timeout)
+        d = next(
+            (d for d in [bridge_dir, *bridge_dir.parents] if (d / "package.json").exists()),
+            bridge_dir,
+        )
+        if (d / "node_modules").exists() or not (d / "package.json").exists():
+            return
+        log(LOG_BAILEYS, f"installing node deps in {d}...")
+        proc = await asyncio.create_subprocess_exec(
+            "npm",
+            "install",
+            "--production",
+            "--ignore-scripts",
+            "--silent",
+            cwd=str(d),
+            stderr=sys.stderr,
+        )
+        if await proc.wait() != 0:
+            raise RuntimeError("npm install failed — is Node.js installed?")
+
+    async def _cmd(self, **kw) -> object:
+        if not self._proc or not self._proc.stdin or self._proc.returncode is not None:
+            raise BaileysDisconnectedError("bridge not connected")
+        cid = self._next_id
+        self._next_id += 1
+        fut = asyncio.get_running_loop().create_future()
+        self._pending[cid] = fut
+        try:
+            self._proc.stdin.write((json.dumps({"id": cid, **kw}) + "\n").encode())
+            await self._proc.stdin.drain()
+            return await asyncio.wait_for(fut, timeout=_cfg.baileys_cmd_timeout)
+        except asyncio.TimeoutError:
+            raise BaileysTimeoutError(f"bridge command timed out: {kw.get('cmd')}")
+        except Exception:
+            raise
+        finally:
+            self._pending.pop(cid, None)
+
     async def _read_events(self) -> None:
         assert self._proc and self._proc.stdout
         async for raw_line in self._proc.stdout:
             line = raw_line.decode().strip()
-            if not line: continue
-            try: obj = json.loads(line)
-            except json.JSONDecodeError: log("baileys", f"bad JSON: {line[:_cfg.log_truncate]}"); continue
-            if "id" in obj:
-                fut = self._pending.pop(obj["id"], None)
-                if fut and not fut.done():
-                    if "error" in obj: fut.set_exception(RuntimeError(obj["error"]))
-                    else: fut.set_result(obj.get("result"))
+            if not line:
                 continue
-            event = obj.get("event")
-            if event == "ready":
-                self.admin_jid = obj.get("adminJid", ""); log("baileys", f"ready, admin={self.admin_jid}")
-                if self.on_ready: await self.on_ready()
-            elif event == "message":
-                raw = obj.get("msg")
-                if not raw: continue
-                msg = WAMessage(jid=raw["jid"], sender=raw["sender"],
-                    push_name=raw.get("pushName") or raw["sender"].split("@")[0],
-                    text=raw["text"], timestamp=raw.get("timestamp", 0),
-                    is_group=raw["isGroup"], message_id=raw.get("messageId"))
-                if self.on_message:
-                    task = asyncio.ensure_future(self.on_message(msg))
-                    self._bg_tasks.add(task); task.add_done_callback(self._bg_tasks.discard)
-            elif event == "poll_update":
-                if self.on_poll_update:
-                    task = asyncio.ensure_future(self.on_poll_update(obj["pollId"], obj["tally"]))
-                    self._bg_tasks.add(task); task.add_done_callback(self._bg_tasks.discard)
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                log(LOG_BAILEYS, f"bad JSON: {line[: _cfg.log_truncate]}")
+                continue
+            try:
+                if "id" in obj:
+                    fut = self._pending.pop(obj["id"], None)
+                    if fut and not fut.done():
+                        if "error" in obj:
+                            fut.set_exception(RuntimeError(obj["error"]))
+                        else:
+                            fut.set_result(obj.get("result"))
+                    continue
+                event = obj.get("event")
+                if event == "ready":
+                    self.admin_jid = obj.get("adminJid", "")
+                    log(LOG_BAILEYS, f"ready, admin={self.admin_jid}")
+                    if self.on_ready:
+                        await self.on_ready()
+                elif event == "message":
+                    raw = obj.get("msg")
+                    if not raw or not all(k in raw for k in ("jid", "sender", "text", "isGroup")):
+                        log(LOG_BAILEYS, f"malformed message: {json.dumps(raw)[:100]}")
+                        continue
+                    msg = Message(
+                        jid=raw["jid"],
+                        sender=raw["sender"],
+                        text=raw["text"],
+                        push_name=raw.get("pushName") or raw["sender"].split("@")[0],
+                        timestamp=raw.get("timestamp", 0),
+                        is_group=raw["isGroup"],
+                        message_id=raw.get("messageId"),
+                        catchup=bool(raw.get("catchup")),
+                        **{
+                            k: raw.get(v)
+                            for k, v in _MEDIA_FIELD_MAP.items()
+                            if raw.get(v) is not None
+                        },
+                    )
+                    if self.on_message:
+                        self._bg(self.on_message(msg))
+                elif event == "media_ready":
+                    log(LOG_MEDIA, f"downloaded: {obj.get('mediaType')}")
+                elif event == EVT_POLL_UPDATE and self.on_poll_update:
+                    pid, tally = obj.get("pollId"), obj.get("tally")
+                    if pid and tally is not None:
+                        self._bg(self.on_poll_update(pid, tally))
+                    else:
+                        log(LOG_BAILEYS, f"malformed poll_update: {json.dumps(obj)[:100]}")
+            except (KeyError, ValueError, TypeError) as e:
+                log(LOG_BAILEYS, f"event handler error: {e}")
+            except Exception as e:
+                log(LOG_BAILEYS, f"unexpected event error: {e}")
+                raise
+        log(LOG_BAILEYS, "stdout closed — bridge disconnected")
 
-async def create_channel(wa: WAAdapter, plugin_dir: str = ".", transport: str = "stdio", host: str = "0.0.0.0", port: int = 3000) -> None:
-    base = Path(plugin_dir); bundled = Path(__file__).parent / "plugins"; setup_logging(base)
-    session_id = str(uuid.uuid4()); started_at = datetime.now(timezone.utc).isoformat()
-    sessions_dir = base / "sessions"; sessions_dir.mkdir(parents=True, exist_ok=True)
-    (sessions_dir / "current.json").write_text(json.dumps({
-        "session_id": session_id, "started_at": started_at, "plugin_dir": str(base.resolve())}, indent=2))
-    log("c3", f"session {session_id} started")
-    def _read(rel: str) -> str | None:
-        return next((p.read_text() for d in [base, bundled] for p in [d / rel] if p.exists()), None)
+
+def _parse_resource_uri(uri_str: str) -> tuple[str, list[str]]:
+    path = uri_str.replace("c3://", "").strip("/")
+    if not path:
+        return "", []
+    p = path.split("/", 1)
+    return p[0], p[1].split("/") if len(p) > 1 else []
+
+
+async def create_channel(
+    wa: ChatAdapter,
+    agent_dir: str = ".",
+    transport: str = "stdio",
+    host: str = "0.0.0.0",
+    port: int = 3000,
+) -> None:
+    base = Path(agent_dir)
+    bundled = _PKG / DIR_APPS
+    setup_logging(base)
+    sid = str(uuid.uuid4())
+    sat = datetime.now(timezone.utc).isoformat()
+    sd = base / DIR_SESSIONS
+    sd.mkdir(parents=True, exist_ok=True)
     try:
-        raw = json.loads((base / "config.json").read_text())
-        config = AppConfig(hosts=[HostConfig(**h) for h in raw.get("hosts", [])],
-                           admins=[HostConfig(**a) for a in raw.get("admins", [])])
-    except Exception:
-        log("c3", "no config.json — no hosts configured"); config = AppConfig()
-    parts: list[str] = []; claude_md = _read("CLAUDE.md")
-    if claude_md: parts.append(claude_md)
-    # Load memory schemas from plugins (but NOT their CLAUDE.md — those go to subagents via --agents)
-    memory_schemas: dict = {}; seen_cats: set[str] = set()
-    for search_root in [base, bundled]:
-        if not search_root.exists(): continue
-        for cat_dir in sorted(search_root.iterdir()):
-            if not cat_dir.is_dir() or cat_dir.name.startswith(".") or cat_dir.name in seen_cats: continue
-            seen_cats.add(cat_dir.name)
-            if (cat_dir / ".memory_schema").exists():
-                try: memory_schemas.update(json.loads((cat_dir / ".memory_schema").read_text()))
-                except (OSError, json.JSONDecodeError) as e: log("plugin", f"bad .memory_schema in {cat_dir.name}: {e}")
-    if memory_schemas: parts.append(f"## Memory Schema\n\n```json\n{json.dumps(memory_schemas, indent=2)}\n```")
-    instructions = "\n\n---\n\n".join(parts); _plugin_proxies: dict[str, PluginMCPProxy] = {}
-    def _scan_mcp_files() -> dict[str, dict]:
-        found: dict[str, dict] = {}
-        for sr in [base, bundled]:
-            if not sr.exists(): continue
-            for cat in sorted(sr.iterdir()):
-                if cat.is_dir() and not cat.name.startswith(".") and cat.name not in found and (cat / ".mcp").exists():
-                    try: found[cat.name] = json.loads((cat / ".mcp").read_text())
-                    except Exception as e: log("plugin", f"bad .mcp in {cat.name}: {e}")
-        return found
-    raw_manifests: list[dict] = []; seen_pj: set[str] = set()
-    for _pj_root in [base, bundled]:
-        for _pj_path in [_pj_root / "plugin.json"] + sorted(
-                [d / "plugin.json" for d in _pj_root.iterdir() if d.is_dir() and not d.name.startswith(".")] if _pj_root.exists() else []):
-            if _pj_path.exists() and str(_pj_path) not in seen_pj:
-                seen_pj.add(str(_pj_path))
-                try: raw_manifests.append(json.loads(_pj_path.read_text()))
-                except (ValueError, json.JSONDecodeError) as e: log("plugin", f"bad plugin.json at {_pj_path}: {e}")
-    manifest = _merge_manifests(raw_manifests); ctrl = PluginController(manifest, config)
-    notify_queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue(maxsize=500)
-    async def notify(content: str, meta: dict) -> None: await notify_queue.put((content, meta))
-    session = ctrl.create_session(); engine = SessionEngine(wa, notify, ctrl, plugin_dir=base)
-    core = ChannelCore(wa, ctrl, session, engine, notify, base, _plugin_proxies, notify_queue)
+        (sd / "current.json").write_text(
+            json.dumps(
+                {"session_id": sid, "started_at": sat, "agent_dir": str(base.resolve())}, indent=2
+            )
+        )
+    except OSError as e:
+        log(LOG_ERROR, f"failed to write session file: {e}")
+    log(LOG_C3, f"session {sid} started")
+
+    def _read(rel):
+        return next((p.read_text() for d in [base, bundled] for p in [d / rel] if p.exists()), None)
+
+    raw_cfg = _read_json(base / "config.json")
+    config = (
+        AppConfig(
+            hosts=[HostConfig(**h) for h in raw_cfg.get("hosts", [])],
+            admins=[HostConfig(**a) for a in raw_cfg.get(ROLE_ADMINS, [])],
+        )
+        if raw_cfg
+        else AppConfig()
+    )
+    parts: list[str] = []
+    claude_md = _read(FILE_CLAUDE_MD)
+    if claude_md:
+        parts.append(claude_md)
+    notify_queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue(maxsize=_cfg.notify_queue_size)
+
+    async def notify(content: str, meta: dict) -> None:
+        try:
+            notify_queue.put_nowait((content, meta))
+        except asyncio.QueueFull:
+            log(LOG_ERROR, "notify queue full, dropping message")
+
+    memory_schemas: dict = {}
+    raw_manifests: list[dict] = []
+    seen_pj: set[str] = set()
+    _scheduler = AsyncIOScheduler()
+    for _name, cat_dir in _scan_dirs(base, bundled):
+        _has_content = (cat_dir / FILE_CLAUDE_MD).exists() or (cat_dir / DIR_SKILLS).is_dir()
+        _has_config = any((cat_dir / f).exists() for f in (FILE_APP_JSON, FILE_AGENT_JSON))
+        if _has_content and not _has_config and cat_dir.parent == base:
+            _ensure_safe_app_json(cat_dir, _name)
+            log(LOG_APP, f"auto-created app.json for {_name}")
+        pj_data = _load_manifest(cat_dir)
+        if not pj_data:
+            continue
+        pj_key = str(
+            next(
+                (cat_dir / f for f in (FILE_APP_JSON, FILE_AGENT_JSON) if (cat_dir / f).exists()),
+                "",
+            )
+        )
+        if not pj_key:
+            continue
+        schema = pj_data.get("memory_schema", {})
+        if schema:
+            memory_schemas.update(schema)
+        if pj_key not in seen_pj:
+            seen_pj.add(pj_key)
+            raw_manifests.append(pj_data)
+        for job in pj_data.get("crons", []):
+            try:
+
+                async def _fire(j=job, p=_name):
+                    await notify(json.dumps({"job": j["job"], "app": p}), {"type": EVT_CRON_TICK})
+
+                _scheduler.add_job(
+                    _fire,
+                    CronTrigger.from_crontab(job["schedule"]),
+                    id=f"{_name}:{job['job']}",
+                    replace_existing=True,
+                )
+            except Exception as e:
+                log(LOG_CRON, f"bad cron in {_name} (schedule={job.get('schedule', '?')}): {e}")
+    for pj in (
+        r / f for r in [base, bundled] for f in (FILE_APP_JSON, FILE_AGENT_JSON) if (r / f).exists()
+    ):
+        if str(pj) not in seen_pj:
+            seen_pj.add(str(pj))
+            d = _read_json(pj)
+            if d:
+                raw_manifests.append(d)
+    if memory_schemas:
+        parts.append(f"## Memory Schema\n\n```json\n{json.dumps(memory_schemas, indent=2)}\n```")
+    instructions = "\n\n---\n\n".join(parts)
+    _app_proxies: dict[str, AppMCPProxy] = {}
+    manifest = _merge_manifests(raw_manifests)
+    ctrl = AccessControl(manifest, config)
+    _per_app_tools: dict[str, set[str]] = {}
+    _all_allowed: set[str] = set()
+    _all_res: set[str] = set()
+    _has_builtin = False
+    for rm in raw_manifests:
+        name, at, ar = (
+            rm.get("name", ""),
+            rm.get("allowed_tools", []),
+            rm.get("allowed_resources", []),
+        )
+        is_builtin = rm.get("trust_level") == TRUST_BUILTIN
+        if at:
+            _per_app_tools[name] = set(at)
+            _all_allowed.update(at)
+        elif not is_builtin:
+            _per_app_tools[name] = {"reply", "send_poll"}
+        if not at and is_builtin:
+            _has_builtin = True
+        if ar:
+            _all_res.update(ar)
+        elif is_builtin:
+            _all_res.update(["c3://schema/*", "c3://memory/*", "c3://media/*"])
+    allowed_tools_set: set[str] | None = None if _has_builtin else (_all_allowed or None)
+    allowed_res_patterns: list[str] | None = list(_all_res) or None
+    if allowed_res_patterns:
+        log(LOG_POLICY, f"allowed_resources: {allowed_res_patterns}")
+    engine = SessionEngine(wa, notify, ctrl, agent_dir=base)
+    core = ChannelCore(
+        wa,
+        ctrl,
+        engine,
+        notify,
+        base,
+        _app_proxies,
+        notify_queue,
+        allowed_tools=allowed_tools_set,
+        allowed_resources=allowed_res_patterns,
+    )
     server = Server("c3", instructions=instructions or None)
+
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
-        tools = [Tool(name=t.name, description=t.description, inputSchema=t.input_schema) for t in BASE_TOOLS]
-        for proxy in _plugin_proxies.values(): tools.extend(proxy.tools)
+        tools = [
+            Tool(name=t.name, description=t.description, inputSchema=t.input_schema)
+            for t in BASE_TOOLS
+        ]
+        for proxy in _app_proxies.values():
+            tools.extend(proxy.tools)
         return tools
+
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict) -> list[TextContent]:
-        for proxy in _plugin_proxies.values():
-            if name in proxy.tool_names: return await proxy.call_tool(name, arguments)
+        for px in _app_proxies.values():
+            if name in px.tool_names:
+                aa = _per_app_tools.get(px.name)
+                if aa is not None and name not in aa:
+                    return _R(f"Error: tool '{name}' not allowed for app '{px.name}'")
+                return await px.call_tool(name, arguments)
         return await core.call_tool(name, arguments)
+
+    _media_dir = base / DIR_SESSIONS / "media"
+
+    @server.list_resources()
+    async def _list_resources() -> list[Resource]:
+        resources = [
+            Resource(
+                name="app-schema",
+                uri="c3://schema/app",
+                description="JSON Schema for app.json",
+                mimeType="application/json",
+            )
+        ]
+        with contextlib.suppress(Exception):
+            resources.extend(
+                Resource(
+                    name=f"memory-{r['app']}",
+                    uri=f"c3://memory/{r['app']}",
+                    description=f"All {r['app']} memory entities",
+                    mimeType="application/json",
+                )
+                for r in _mem(base)["entities"].distinct("app")
+            )
+        if _media_dir.exists():
+            resources.extend(
+                Resource(
+                    name=f"media-{f.stem}",
+                    uri=f"c3://media/{f.stem}",
+                    description=f"Media file: {f.name}",
+                    mimeType=_MIME_TYPES.get(f.suffix.lstrip("."), "application/octet-stream"),
+                    size=f.stat().st_size,
+                )
+                for f in sorted(_media_dir.iterdir())
+                if f.is_file() and f.stat().st_size > 0
+            )
+        return resources
+
+    @server.list_resource_templates()
+    async def _list_resource_templates() -> list[ResourceTemplate]:
+        return [ResourceTemplate(**t) for t in _C["resource_templates"]]
+
+    @server.read_resource()
+    async def _read_resource(uri) -> list[TextResourceContents | BlobResourceContents]:
+        uri_str = str(uri)
+
+        def _err(t):
+            return [TextResourceContents(uri=uri, text=t, mimeType="text/plain")]
+
+        if allowed_res_patterns is not None:
+            from fnmatch import fnmatch
+
+            if not any(fnmatch(uri_str, p) for p in allowed_res_patterns):
+                log(LOG_POLICY, f"blocked resource: {uri_str}")
+                return _err(f"Error: access denied to {uri_str}")
+        scheme, rparts = _parse_resource_uri(uri_str)
+        if scheme == "schema":
+            return [
+                TextResourceContents(
+                    uri=uri,
+                    text=json.dumps(AppManifest.model_json_schema(), indent=2),
+                    mimeType="application/json",
+                )
+            ]
+        if scheme == "memory":
+            kwargs: dict = {"app": rparts[0]} if rparts else {}
+            if len(rparts) > 1:
+                kwargs["entity"] = rparts[1]
+            return [
+                TextResourceContents(
+                    uri=uri,
+                    text=json.dumps(list(_mem(base)["entities"].find(**kwargs)), indent=2),
+                    mimeType="application/json",
+                )
+            ]
+        if scheme == "media":
+            import base64
+
+            msg_id = rparts[0] if rparts else ""
+            f = next(
+                (
+                    f
+                    for f in (_media_dir.iterdir() if _media_dir.exists() else [])
+                    if f.stem == msg_id and f.is_file()
+                ),
+                None,
+            )
+            if f:
+                return [
+                    BlobResourceContents(
+                        uri=uri,
+                        blob=base64.b64encode(f.read_bytes()).decode(),
+                        mimeType=_MIME_TYPES.get(f.suffix.lstrip("."), "application/octet-stream"),
+                    )
+                ]
+            return _err("Error: media not found")
+        return _err(f"Error: unknown resource {uri_str}")
+
     wa.on_message = core.on_message
+
     async def _on_wa_ready() -> None:
-        await notify(f"SESSION START\nsession_id: {session_id}\nstarted_at: {started_at}",
-            {"type": "session_start", "session_id": session_id, "started_at": started_at})
+        rf = base / DIR_SESSIONS / "restart_count"
+        try:
+            rc = int(rf.read_text().strip()) + 1 if rf.exists() else 1
+        except (ValueError, OSError):
+            rc = 1
+        rf.write_text(str(rc))
+        label = _MSG["session_fresh"] if rc == 1 else _MSG["session_resumed"].format(count=rc)
+        body = _MSG["session_body"].format(label=label, sid=sid, sat=sat)
+        await notify(
+            body,
+            {
+                "type": EVT_SESSION_START,
+                "session_id": sid,
+                "started_at": sat,
+                "restart_count": str(rc),
+            },
+        )
+
     wa.on_ready = _on_wa_ready
+
+    def _notif(method, params):
+        return SessionMessage(
+            JSONRPCMessage(root=JSONRPCNotification(jsonrpc="2.0", method=method, params=params))
+        )
+
     async def _drain_notifications(write_stream) -> None:
         while True:
             content, meta = await notify_queue.get()
-            if meta.get("_tools_changed"):
+            if meta.get(EVT_TOOLS_CHANGED):
                 with contextlib.suppress(Exception):
-                    notif = JSONRPCNotification(jsonrpc="2.0", method="notifications/tools/list_changed", params={})
-                    await write_stream.send(SessionMessage(JSONRPCMessage(root=notif)))
+                    await write_stream.send(_notif("notifications/tools/list_changed", {}))
                 continue
-            mc = ctrl.jid_mask.mask(content); mm = ctrl.jid_mask.mask_meta(meta) if meta else meta
-            log("notify", f"type={mm.get('type', '?')} {mc[:_cfg.log_truncate].replace(chr(10), ' ')}")
+            mc = ctrl.mask(content)
+            mm = ctrl.mask_meta(meta) if meta else meta
+            log(
+                "notify",
+                f"type={mm.get('type', '?')} {mc[: _cfg.log_truncate].replace(chr(10), ' ')}",
+            )
             try:
-                notif = JSONRPCNotification(jsonrpc="2.0", method="notifications/claude/channel",
-                    params={"content": mc, "meta": mm})
-                await write_stream.send(SessionMessage(JSONRPCMessage(root=notif)))
-            except Exception as e: log("error", f"notify failed: {e}")
-    def _boot_proxies(tg) -> None:
-        for pname, pparams in _scan_mcp_files().items():
-            proxy = PluginMCPProxy(pname, pparams, base); _plugin_proxies[pname] = proxy; tg.start_soon(proxy.run)
-    _scheduler = AsyncIOScheduler()
-    for root in [base, bundled]:
-        if not root.exists(): continue
-        for cat in [c for c in root.iterdir() if c.is_dir() and (c / ".crons").exists()]:
-            try:
-                for job in json.loads((cat / ".crons").read_text()):
-                    async def _fire(j=job, p=cat.name): await notify(json.dumps({"job": j["job"], "plugin": p}), {"type": "cron_tick"})
-                    _scheduler.add_job(_fire, CronTrigger.from_crontab(job["schedule"]), id=f"{cat.name}:{job['job']}", replace_existing=True)
-            except Exception as e: log("cron", f"bad .crons in {cat.name}: {e}")
+                await write_stream.send(
+                    _notif("notifications/claude/channel", {"content": mc, "meta": mm})
+                )
+            except Exception as e:
+                log(LOG_ERROR, f"notify failed: {e}")
+
     _scheduler.start()
     import signal
-    def _shutdown(sig, frame):
-        log("c3", f"shutting down (signal {sig})...")
+
+    def _shutdown(*_args):
+        log(LOG_C3, "shutting down...")
         _scheduler.shutdown(wait=False)
-        if hasattr(wa, '_proc') and wa._proc: wa._proc.terminate()
+        if hasattr(wa, "_shutting_down"):
+            wa._shutting_down = True
+        if hasattr(wa, "_proc") and wa._proc:
+            wa._proc.terminate()
+        if hasattr(wa, "_bridge_stderr") and wa._bridge_stderr:
+            with contextlib.suppress(Exception):
+                wa._bridge_stderr.close()
         sys.exit(0)
+
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
-    async def _watch_plugins() -> None:
+
+    async def _watch_apps() -> None:
         dirs = [str(d) for d in [base, bundled] if d.exists()]
-        if not dirs: return
+        if not dirs:
+            return
         async for changes in awatch(*dirs):
             for _, path in changes:
-                if not path.endswith(".md"): continue
+                p = Path(path)
+                if not path.endswith(".md"):
+                    continue
+                if (
+                    p.name == FILE_CLAUDE_MD
+                    and p.parent.parent == base
+                    and not (p.parent / FILE_APP_JSON).exists()
+                ):
+                    _ensure_safe_app_json(p.parent, p.parent.name)
+                    log(LOG_C3, f"auto-created app.json for {p.parent.name}")
+                if not (
+                    (p.name == FILE_CLAUDE_MD and p.parent.parent in (base, bundled))
+                    or (p.parent.name == DIR_SKILLS and p.parent.parent.parent in (base, bundled))
+                ):
+                    continue
                 with contextlib.suppress(OSError):
-                    content = Path(path).read_text(); skill = Path(path).stem
-                    await notify(content, {"type": "skill_load", "skill": skill})
-                    log("c3", f"hot-reloaded: {Path(path).name}")
+                    await notify(p.read_text(), {"type": EVT_SKILL_LOAD, "skill": p.stem})
+                    log(LOG_C3, f"hot-reloaded: {p.name}")
+
+    _init_opts = server.create_initialization_options(
+        experimental_capabilities={"claude/channel": {}}
+    )
     if transport == "sse":
         import uvicorn
         from mcp.server.sse import SseServerTransport
         from starlette.applications import Starlette
         from starlette.routing import Mount, Route
         from starlette.responses import JSONResponse
-        sse_transport = SseServerTransport("/messages/")
-        async def _handle_sse(request):
-            async with sse_transport.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream), anyio.create_task_group() as tg:
-                tg.start_soon(server.run, read_stream, write_stream, server.create_initialization_options(experimental_capabilities={"claude/channel": {}}))
-                tg.start_soon(_drain_notifications, write_stream); tg.start_soon(_watch_plugins)
-        async def _health(request): return JSONResponse({"status": "ok"})
-        starlette_app = Starlette(routes=[Route("/health", endpoint=_health), Route("/sse", endpoint=_handle_sse), Mount("/messages/", app=sse_transport.handle_post_message)])
-        log("c3", f"MCP SSE server starting on {host}:{port} ...")
-        config = uvicorn.Config(starlette_app, host=host, port=port, log_level="warning")
-        uv_server = uvicorn.Server(config)
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(uv_server.serve); tg.start_soon(wa.connect); _boot_proxies(tg)
-    else:
-        log("c3", "MCP stdio server starting...")
-        async with stdio_server() as (read_stream, write_stream), anyio.create_task_group() as tg:
-            tg.start_soon(server.run, read_stream, write_stream, server.create_initialization_options(experimental_capabilities={"claude/channel": {}}))
-            tg.start_soon(wa.connect); tg.start_soon(_drain_notifications, write_stream)
-            tg.start_soon(_watch_plugins); _boot_proxies(tg)
 
-def _find_plugin_dir(name: str) -> str | None:
+        sset = SseServerTransport("/messages/")
+
+        async def _sse(req):
+            async with (
+                sset.connect_sse(req.scope, req.receive, req._send) as (rs, ws),
+                anyio.create_task_group() as tg,
+            ):
+                tg.start_soon(server.run, rs, ws, _init_opts)
+                tg.start_soon(_drain_notifications, ws)
+                tg.start_soon(_watch_apps)
+
+        routes = [
+            Route("/health", endpoint=lambda r: JSONResponse({"status": "ok"})),
+            Route("/sse", endpoint=_sse),
+            Mount("/messages/", app=sset.handle_post_message),
+        ]
+        if hasattr(wa, "starlette_routes"):
+            routes.extend(wa.starlette_routes())
+        app_ = Starlette(routes=routes)
+        log(LOG_C3, f"MCP SSE server on {host}:{port}...")
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                uvicorn.Server(
+                    uvicorn.Config(app_, host=host, port=port, log_level="warning")
+                ).serve
+            )
+            tg.start_soon(wa.connect)
+    else:
+        log(LOG_C3, "MCP stdio server starting...")
+        async with stdio_server() as (rs, ws), anyio.create_task_group() as tg:
+            tg.start_soon(server.run, rs, ws, _init_opts)
+            tg.start_soon(wa.connect)
+            tg.start_soon(_drain_notifications, ws)
+            tg.start_soon(_watch_apps)
+
+
+def _find_app_dir(name: str) -> str | None:
+    # Bug #63: validate name is alphanumeric + hyphens only
+    if not re.match(r"^[a-zA-Z0-9_-]+$", name):
+        return None
     import importlib.util
+
     spec = importlib.util.find_spec(f"c3_{name.replace('-', '_')}")
-    if spec and spec.origin: return str(Path(spec.origin).parent)
-    bundled = Path(__file__).parent / "plugins" / name
-    if bundled.is_dir(): return str(bundled)
-    sibling = Path(__file__).parent.parent.parent / f"c3-{name}"
-    if (sibling / "config.json").exists() or (sibling / "CLAUDE.md").exists(): return str(sibling)
+    if spec and spec.origin:
+        return str(Path(spec.origin).parent)
+    for p in [_PKG / DIR_APPS / name, _PKG.parent.parent / f"c3-{name}"]:
+        if p.is_dir() and any(
+            (p / f).exists() for f in ("config.json", FILE_CLAUDE_MD, FILE_APP_JSON)
+        ):
+            return str(p)
     return None
 
-def _build_agents_json(plugins_root: Path) -> str:
-    """Scan plugins/ dirs and build --agents JSON, inlining claude.md + skills + per-plugin mcpServers."""
+
+def _build_apps_json(apps_root: Path) -> str:
     agents: dict = {}
-    bundled = Path(__file__).parent / "plugins"
-    seen: dict[str, Path] = {}
-    # bundled plugins first, user plugins_root overrides by name
-    for root in [bundled, plugins_root]:
-        if root.is_dir():
-            for d in sorted(root.iterdir()):
-                if d.is_dir(): seen[d.name] = d
-    for name, d in seen.items():
-        claude_md = d / "CLAUDE.md"
-        try: prompt_text = claude_md.read_text()
-        except OSError: continue
-        meta: dict = {}
-        if (d / "plugin.json").exists():
-            with contextlib.suppress(Exception): meta = json.loads((d / "plugin.json").read_text())
-        skills = ""
-        if (d / "skills").is_dir():
-            for sk in sorted((d / "skills").glob("*.md")):
-                with contextlib.suppress(OSError): skills += f"\n\n{sk.read_text()}"
-        mcp_servers: dict = {}
-        if (d / "mcp.json").exists():
-            with contextlib.suppress(Exception):
-                for sname, scfg in json.loads((d / "mcp.json").read_text()).get("mcpServers", {}).items():
-                    if "command" in scfg:
-                        cmd = Path(scfg["command"])
-                        if not cmd.is_absolute(): scfg["command"] = str((d / cmd).resolve())
-                    mcp_servers[sname] = scfg
-        entry: dict = {"description": meta.get("description", name), "prompt": prompt_text + skills}
-        if mcp_servers: entry["mcpServers"] = mcp_servers
+    bundled = _PKG / DIR_APPS
+    for name, d in _scan_dirs(apps_root, bundled):
+        try:
+            prompt_text = (d / FILE_CLAUDE_MD).read_text()
+        except OSError:
+            continue
+        meta = _load_manifest(d)
+        entry: dict = {"description": meta.get("description", name), "prompt": prompt_text}
+        mcp_data = _read_json(d / "mcp.json")
+        if mcp_data:
+            ms = {
+                sn: {
+                    **sc,
+                    **(
+                        {"command": str((d / sc["command"]).resolve())}
+                        if "command" in sc and not Path(sc["command"]).is_absolute()
+                        else {}
+                    ),
+                }
+                for sn, sc in mcp_data.get("mcpServers", {}).items()
+            }
+            if ms:
+                entry["mcpServers"] = ms
         agents[name] = entry
     return json.dumps(agents)
 
-def _launcher_mode(plugin_dir: str, skip_permissions: bool, sse_url: str | None = None) -> None:
+
+def _launcher_mode(agent_dir: str, skip_permissions: bool, sse_url: str | None = None) -> None:
     import shutil
-    if not shutil.which("claude"): sys.exit("Error: 'claude' CLI not found.\nInstall: npm install -g @anthropic-ai/claude-code\nAuth:    claude login")
-    base = Path(plugin_dir).resolve()
-    sd = base / "sessions"; sd.mkdir(exist_ok=True)
-    (base / "logs").mkdir(exist_ok=True)
-    upstream_file = base / ".upstream.mcp.json"
+
+    if not shutil.which("claude"):
+        sys.exit("Error: 'claude' CLI not found")
+    base = Path(agent_dir).resolve()
+    (base / DIR_LOGS).mkdir(exist_ok=True)
+    mf = _ensure_mcp_json(base)
     if sse_url:
-        upstream_cfg = {"mcpServers": {"whatsapp": {"type": "sse", "url": sse_url}}}
-    else:
-        upstream_cfg = {"mcpServers": {"whatsapp": {"command": "c3-py",
-            "args": ["--serve", "--plugin-dir", str(base), "--sessions-dir", str(sd)]}}}
-    upstream_file.write_text(json.dumps(upstream_cfg, indent=2))
-    # approval-proxy doesn't forward channel notifications (notifications/claude/channel)
-    # so we connect c3-py directly — tool approval is handled by the WhatsApp permission relay instead
-    mcp_file = base / ".mcp.json"
-    mcp_file.write_text(json.dumps(upstream_cfg, indent=2))
-    log("c3", "MCP: c3-py direct")
-    agents_json = _build_agents_json(base)
-    log("c3", f"registered agents: {', '.join(json.loads(agents_json).keys())}")
-    claude_args = ["claude", "--mcp-config", str(mcp_file),
-                   "--agents", agents_json, "--dangerously-skip-permissions",
-                   "--dangerously-load-development-channels", "server:whatsapp"]
-    log("c3", "launching Claude Code...")
+        mcfg = {"mcpServers": {"whatsapp": {"type": "sse", "url": sse_url}}}
+        mf.write_text(json.dumps(mcfg, indent=2))
+    (base / ".upstream.mcp.json").write_text(mf.read_text())
+    agents_json = _build_apps_json(base)
+    log(LOG_C3, f"registered apps: {', '.join(json.loads(agents_json).keys())}")
+    sd = base / DIR_SESSIONS
+    clear_flag = sd / "clear_session"
+    if clear_flag.exists():
+        clear_flag.unlink()
+        log(LOG_C3, "fresh session (cleared by host)")
+    claude_args = [
+        "claude",
+        "--model",
+        _C["server"]["model"],
+        "--mcp-config",
+        str(mf),
+        "--agents",
+        agents_json,
+        "--dangerously-skip-permissions",
+        "--dangerously-load-development-channels",
+        "server:whatsapp",
+    ]
+    log(LOG_C3, "launching Claude Code...")
     os.chdir(base)
-    # Auto-accept dialogs using Python pty + delayed Enter keypress
-    import subprocess, threading, time, pty, select
-    _ansi_re = re.compile(rb'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b[()][0-9A-B]|\x1b\[[\?]?[0-9;]*[hlm]')
-    log_file = open(base / "logs" / "claude.log", "ab")
+    import subprocess
+    import threading
+    import time
+    import pty
+    import select
+
+    _ansi_re = re.compile(
+        rb"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b[()][0-9A-B]|\x1b\[[\?]?[0-9;]*[hlm]"
+    )
     master_fd, slave_fd = pty.openpty()
-    proc = subprocess.Popen(claude_args, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True)
-    os.close(slave_fd)
-    def _auto_accept():
-        for delay in [5, 2, 2]:
-            time.sleep(delay)
-            try: os.write(master_fd, b"\r")
-            except OSError: break
-    threading.Thread(target=_auto_accept, daemon=True).start()
+    lf = open(base / DIR_LOGS / "claude.log", "ab")
     try:
-        while True:
-            try:
-                r, _, _ = select.select([master_fd], [], [], 1.0)
-                if r:
-                    data = os.read(master_fd, 4096)
-                    if not data: break
-                    # Raw TUI to stdout (for docker attach)
-                    sys.stdout.buffer.write(data); sys.stdout.buffer.flush()
-                    # Clean text to log file (strip ANSI)
-                    clean = _ansi_re.sub(b'', data).replace(b'\r', b'')
-                    if clean.strip(): log_file.write(clean); log_file.flush()
-            except OSError: break
-            if proc.poll() is not None: break
+        proc = subprocess.Popen(
+            claude_args, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True
+        )
+    except Exception:
+        lf.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
+    os.close(slave_fd)
+    threading.Thread(
+        target=lambda: [time.sleep(d) or os.write(master_fd, b"\r") for d in [3, 2, 2, 2, 2, 2]],
+        daemon=True,
+    ).start()
+    try:
+        while proc.poll() is None:
+            r, _, _ = select.select([master_fd], [], [], 1.0)
+            if not r:
+                continue
+            data = os.read(master_fd, 4096)
+            if not data:
+                break
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+            clean = _ansi_re.sub(b"", data).replace(b"\r", b"")
+            if clean.strip():
+                lf.write(clean)
+                lf.flush()
+    except OSError:
+        pass
     finally:
-        log_file.close()
+        lf.close()
         os.close(master_fd)
     sys.exit(proc.returncode or 0)
 
-def _cmd_check(base: Path) -> None:
-    w, e = [], []
-    for f, msg in [("config.json", "no hosts configured"), ("plugin.json", "using default RBAC"), ("CLAUDE.md", "no custom instructions")]:
-        if not (base / f).exists(): w.append(f"{f} missing — {msg}")
-        elif f.endswith(".json"):
-            with contextlib.suppress(json.JSONDecodeError): json.loads((base / f).read_text())
-    g = list((base / "skills").glob("*.md")) if (base / "skills").exists() else []
-    if g: print(f"skills/: {len(g)} skill(s): {', '.join(x.stem for x in g)}")
-    [print(f"WARN  {x}", file=sys.stderr) for x in w]; [print(f"ERROR {x}", file=sys.stderr) for x in e]
-    sys.exit(1) if e else print("OK — plugin dir looks good")
-
-_INIT_CONFIG = {"hosts": [{"jid": "YOURPHONE@s.whatsapp.net", "name": "You"}], "admins": []}
-
-def _cmd_init(base: Path, name: str) -> None:
-    base.mkdir(parents=True, exist_ok=True); sessions = base / "sessions"; sessions.mkdir(exist_ok=True)
-    def _wif(p, content): (print(f"skip  {p.name} (exists)") if p.exists() else (p.write_text(content), print(f"wrote {p.name}")))
-    _wif(base / "config.json", json.dumps(_INIT_CONFIG, indent=2))
-    mcp_file = base / ".mcp.json"
-    if not mcp_file.exists():
-        mcp_file.write_text(json.dumps({"mcpServers": {"whatsapp": {"command": "c3-py",
-            "args": ["--serve", "--plugin-dir", str(base.resolve()), "--sessions-dir", str(sessions.resolve())]}}}, indent=2))
-        print("wrote .mcp.json")
-    else: print("skip  .mcp.json (exists)")
-    print(f"\nPlugin '{name}' initialised in {base.resolve()}")
-    print("  plugins/games/ + plugins/skills/ → bundled in c3-py package")
-    print(f"  Add custom skills to {base}/skills/<name>.md to override bundled ones\n\nNext steps:")
-    print(f"  1. Edit config.json — set your WhatsApp JID under 'hosts'\n  2. c3-py auth --sessions-dir {sessions}\n  3. c3-py {base.resolve()}")
-
-def _cmd_auth(sessions_dir: Path) -> None:
-    import shutil, subprocess
-    if not shutil.which("node"): sys.exit("Error: 'node' not found. Install Node.js 18+ first.")
-    sessions_dir.mkdir(parents=True, exist_ok=True); bridge_dir = _BRIDGE.parent
-    if not (bridge_dir / "node_modules").exists():
-        print("Installing Node.js dependencies (first run)...")
-        if subprocess.run(["npm", "install", "--production", "--ignore-scripts", "--silent"], cwd=str(bridge_dir)).returncode != 0: sys.exit("npm install failed.")
-    creds = sessions_dir / "creds.json"
-    if creds.exists() and creds.stat().st_size > 10:
-        print(f"Session found at {sessions_dir}\nAlready authenticated. Delete sessions/ to re-authenticate.\nRun 'c3-py games' to start."); return
-    if creds.exists() and creds.stat().st_size <= 10:
-        print(f"Stale session found (empty creds). Cleaning up...")
-        import shutil as _sh; _sh.rmtree(sessions_dir, ignore_errors=True); sessions_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Starting WhatsApp authentication...\nSessions will be saved to: {sessions_dir.resolve()}")
-    print("Scan the QR code with your phone → WhatsApp > Linked Devices > Link a Device\n")
-    proc = subprocess.Popen(["node", str(_BRIDGE)], env={**os.environ, "SESSIONS_DIR": str(sessions_dir)},
-        stderr=sys.stderr, stdout=subprocess.PIPE)
-    try:
-        for raw in proc.stdout:  # type: ignore[union-attr]
-            line = raw.decode().strip()
-            if not line: continue
-            try:
-                obj = json.loads(line)
-                if obj.get("event") == "ready":
-                    admin = obj.get("adminJid", "")
-                    print(f"\n✅ Authenticated as {admin.split(':')[0].split('@')[0]}\nSession saved. Run 'c3-py games' to start.")
-                    proc.terminate(); return
-            except Exception: pass
-    except KeyboardInterrupt: print("\nCancelled.")
-    finally: proc.terminate(); proc.wait()
-
-def _send_test_message(sessions_dir: Path, jid: str, text: str = "✅ c3-py setup complete — bot is online!") -> bool:
-    """Briefly start the bridge and send one message. Returns True on success."""
-    import subprocess, threading
-    proc = subprocess.Popen(["node", str(_BRIDGE)], env={**os.environ, "SESSIONS_DIR": str(sessions_dir)},
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    sent = threading.Event(); ok = threading.Event()
-    def _writer():
-        try:
-            for raw in proc.stdout:  # type: ignore[union-attr]
-                line = raw.decode().strip()
-                if not line: continue
-                try:
-                    obj = json.loads(line)
-                    if obj.get("event") == "ready" and not sent.is_set():
-                        sent.set(); cmd = json.dumps({"cmd": "send", "jid": jid, "text": text}) + "\n"
-                        proc.stdin.write(cmd.encode()); proc.stdin.flush()  # type: ignore[union-attr]
-                    elif obj.get("event") == "sent": ok.set(); return
-                except Exception: pass
-        except Exception: pass
-    t = threading.Thread(target=_writer, daemon=True); t.start(); t.join(timeout=_cfg.test_message_timeout)
-    proc.terminate(); proc.wait(); return ok.is_set()
 
 def _check_prereqs() -> list[str]:
-    """Check prerequisites and return list of issues."""
-    import shutil, subprocess
+    import shutil
+    import subprocess
+
     issues = []
+    _pre = _C["prereqs"]
+    min_ver = _cfg.node_min_version
     if not shutil.which("node"):
-        issues.append("Node.js not found — install Node.js 18+ (https://nodejs.org)")
-    else:
-        try:
-            v = subprocess.check_output(["node", "--version"], text=True).strip()
-            major = int(v.lstrip("v").split(".")[0])
-            if major < 18: issues.append(f"Node.js {v} is too old — need 18+")
-        except Exception: pass
-    if not shutil.which("claude"):
-        issues.append("Claude Code CLI not found — install: curl -fsSL https://claude.ai/install.sh | bash")
-    if not shutil.which("npm"):
-        issues.append("npm not found — comes with Node.js")
+        issues.append(_pre["checks"][0]["missing"])
+    elif (
+        int(
+            subprocess.check_output(["node", "--version"], text=True)
+            .strip()
+            .lstrip("v")
+            .split(".")[0]
+        )
+        < min_ver
+    ):
+        issues.append(_pre["node_too_old"].format(min_version=min_ver))
+    for check in _pre["checks"][1:]:
+        if not shutil.which(check["cmd"]):
+            issues.append(check["missing"])
     return issues
 
-def _cmd_setup(base: Path) -> None:
+
+def _cmd_auth(sessions_dir: Path) -> None:
     import shutil
-    print("\n🚀  c3-py setup wizard\n" + "─" * 40)
-    issues = _check_prereqs()
-    if issues:
-        print("\n⚠️  Prerequisites check:")
-        for i in issues: print(f"   ❌ {i}")
-        if input("\n   Continue anyway? [y/N] ").strip().lower() != "y": sys.exit(1)
-    else:
-        print("   ✅ All prerequisites found")
-    print(f"\n📁  Plugin directory: {base.resolve()}")
-    answer = input("   Use this directory? [Y/n] ").strip().lower()
-    if answer in ("n", "no"): base = Path(input("   Enter path: ").strip()).expanduser().resolve()
-    base.mkdir(parents=True, exist_ok=True); sessions = base / "sessions"; sessions.mkdir(exist_ok=True)
-    print("\n👤  Your WhatsApp account details:")
-    host_jid = input("   Phone number JID (e.g. 911234567890@s.whatsapp.net): ").strip()
-    host_name = input("   Display name [Host]: ").strip() or "Host"
-    print("\n🤖  Claude Code CLI:"); claude_path = shutil.which("claude")
-    if claude_path: print(f"   Found at {claude_path}")
-    else:
-        print("   'claude' not found in PATH.")
-        custom_claude = input("   Full path to claude binary (leave blank to skip): ").strip()
-        if custom_claude:
-            os.environ["PATH"] = str(Path(custom_claude).parent) + os.pathsep + os.environ["PATH"]
-            claude_path = custom_claude
-    print("\n📱  WhatsApp authentication:"); creds = sessions / "creds.json"
-    if creds.exists(): print("   Already authenticated ✅")
-    else:
-        input("   Press Enter to start QR scan..."); _cmd_auth(sessions)
-        if not creds.exists(): print("\n⚠️  Authentication did not complete. Run 'c3-py auth' later.")
-    bundled_plugins = sorted((Path(__file__).parent / "plugins" / "games" / "skills").glob("*.md"))
-    startup_plugins: list[str] = []
-    if bundled_plugins:
-        print("\n🧩  Available plugins:")
-        for i, p in enumerate(bundled_plugins, 1): print(f"   {i}. {p.stem}")
-        for token in re.split(r"[,\s]+", input("   Auto-load at startup (comma-separated numbers or names, blank=none): ").strip()):
-            if not token.strip(): continue
-            idx = int(token) - 1 if token.strip().isdigit() else -1
-            if 0 <= idx < len(bundled_plugins): startup_plugins.append(bundled_plugins[idx].stem)
-            elif not token.strip().isdigit(): startup_plugins.append(token.strip().removesuffix(".md"))
-    config_path = base / "config.json"; existing: dict = {}
-    if config_path.exists():
-        with contextlib.suppress(Exception): existing = json.loads(config_path.read_text())
-    existing["hosts"] = [{"jid": host_jid, "name": host_name}]
-    if startup_plugins: existing["startup_plugins"] = startup_plugins
-    config_path.write_text(json.dumps(existing, indent=2)); print(f"\n✅  config.json saved → {config_path}")
-    mcp_file = base / ".mcp.json"
-    if not mcp_file.exists():
-        mcp_cfg = {"mcpServers": {"whatsapp": {"command": "c3-py",
-            "args": ["--serve", "--plugin-dir", str(base), "--sessions-dir", str(sessions)]}}}
-        mcp_file.write_text(json.dumps(mcp_cfg, indent=2)); print(f"✅  .mcp.json saved → {mcp_file}")
-    else: print("   .mcp.json already exists — skipped")
-    print("\n📨  Send a test WhatsApp message?")
-    if creds.exists() and host_jid:
-        answer = input(f"   Send to {host_jid}? [Y/n] ").strip().lower()
-        if answer not in ("n", "no"):
-            print("   Sending...", end=" ", flush=True)
-            ok = _send_test_message(sessions, host_jid)
-            print("✅ delivered!" if ok else "⚠️  timed out (bridge may need a moment — try again later)")
-    else: print("   Skipped — authenticate first.")
-    print("\n" + "─" * 40 + "\n🎉  Setup complete!\n")
-    print(f"   Plugin dir : {base}\n   Sessions   : {sessions}")
-    if startup_plugins: print(f"   Plugins    : {', '.join(startup_plugins)}")
-    print()
-    if claude_path and input("🚀  Launch Claude now? [Y/n] ").strip().lower() not in ("n", "no"): _launcher_mode(str(base), False)
-    elif not claude_path: print("   Run 'c3-py games' (or your plugin name) to start.")
+    import subprocess
 
-_PLUGIN_TEMPLATES = {
-    "CLAUDE.md": "## {name}\n\nDescribe what this plugin does and what capabilities it adds.\n",
-    "plugin.json": '{{\n  "access": {{\n    "commands": {{}},\n    "dm":    ["hosts", "admins"],\n    "group": []\n  }}\n}}\n',
-    ".memory_schema": '{{\n  "example_entity": {{\n    "fields": ["field1", "field2"],\n    "example": {{"plugin": "{name}", "entity": "example_entity", "field1": "value1"}}\n  }}\n}}\n',
-    "skills/{name}.md": "## {name} skill\n\nInstructions for Claude when this skill is active.\n",
-}
+    if not shutil.which("node"):
+        sys.exit("Error: Node.js not found")
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    bd = _BRIDGE.parent
+    if (
+        not (bd / "node_modules").exists()
+        and subprocess.run(
+            ["npm", "install", "--production", "--ignore-scripts", "--silent"], cwd=str(bd)
+        ).returncode
+        != 0
+    ):
+        sys.exit("npm install failed.")
+    creds = sessions_dir / "creds.json"
+    sz = creds.stat().st_size if creds.exists() else 0
+    if sz > _cfg.creds_min_size:
+        print("Already authenticated. Delete sessions/ to re-auth.")
+        return
+    if sz:
+        shutil.rmtree(sessions_dir, ignore_errors=True)
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+    print("Scan QR: WhatsApp > Linked Devices > Link a Device\n")
+    proc = subprocess.Popen(
+        ["node", str(_BRIDGE)],
+        env={**os.environ, "SESSIONS_DIR": str(sessions_dir)},
+        stderr=sys.stderr,
+        stdout=subprocess.PIPE,
+    )
+    try:
+        for raw in proc.stdout:  # type: ignore[union-attr]
+            with contextlib.suppress(Exception):
+                obj = json.loads(raw.decode().strip())
+                if obj.get("event") == "ready":
+                    print(
+                        f"✅ Authenticated as {obj.get('adminJid', '').split(':')[0].split('@')[0]}"
+                    )
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait()
 
-def _cmd_plugin_new(dest: Path) -> None:
-    name = dest.name; dest.mkdir(parents=True, exist_ok=True)
-    (dest / "skills").mkdir(exist_ok=True)
-    for fname_tpl, content_tpl in _PLUGIN_TEMPLATES.items():
-        fname = fname_tpl.replace("{name}", name); p = dest / fname
-        p.parent.mkdir(parents=True, exist_ok=True)
-        if p.exists(): print(f"skip  {fname} (exists)")
-        else: p.write_text(content_tpl.format(name=name)); print(f"wrote {fname}")
-    print(f"\nPlugin '{name}' created at {dest.resolve()}")
-    for line in [f"  Edit {name}/CLAUDE.md          — boot-time capability description",
-                 f"  Edit {name}/skills/{name}.md   — skill rules loaded on demand",
-                 f"  Edit {name}/.memory_schema      — entity schemas",
-                 f"  Add  {name}/.mcp               — declare extra MCP servers (optional)",
-                 f"  Add  {name}/.crons             — scheduled jobs (optional)"]: print(line)
 
-_app = typer.Typer(name="c3-py", help="c3 WhatsApp agent — launcher and MCP server", add_completion=False)
+def _safe_app_json(name, desc=""):
+    return {
+        **_C["safe_app"],
+        "name": name,
+        "description": desc or name,
+        "allowed_resources": [f"c3://memory/{name}/*"],
+    }
 
-@_app.command("setup")
-def _cli_setup(plugin_dir: str = typer.Option(".", "--plugin-dir", "-d", help="Plugin directory")):
-    """Interactive e2e setup wizard."""; _cmd_setup(Path(plugin_dir))
+
+def _ensure_safe_app_json(dest: Path, name: str, description: str = "") -> None:
+    if (dest / FILE_APP_JSON).exists():
+        return
+    (dest / FILE_APP_JSON).write_text(json.dumps(_safe_app_json(name, description), indent=2))
+    print("  ⚠️  Auto-generated app.json (host-only, sandboxed, minimal tools)")
+
+
+def _scaffold_app(dest):
+    n = dest.name
+    files = {
+        **{k.format(name=n): v.format(name=n) for k, v in _C["scaffold"].items()},
+        FILE_APP_JSON: json.dumps(_safe_app_json(n, ""), indent=2),
+    }
+    for fn, c in files.items():
+        target = dest / fn
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.write_text(c)
+            print(f"wrote {fn}")
+
+
+def _fetch_content(s: str) -> str:
+    if s.startswith(("http://", "https://")):
+        import urllib.request
+
+        return urllib.request.urlopen(s, timeout=_cfg.fetch_timeout).read().decode()
+    p = Path(s)
+    return p.read_text() if s and p.is_file() else s
+
+
+def _ensure_mcp_json(base: Path) -> Path:
+    mf = base / ".mcp.json"
+    sd = base / DIR_SESSIONS
+    sd.mkdir(exist_ok=True)
+    # Only write if missing or doesn't contain a whatsapp server
+    existing = _read_json(mf)
+    if not existing or "whatsapp" not in existing.get("mcpServers", {}):
+        mf.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        **existing.get("mcpServers", {}),
+                        "whatsapp": {
+                            "command": "c3-py",
+                            "args": [
+                                "--serve",
+                                "--agent-dir",
+                                str(base),
+                                "--sessions-dir",
+                                str(sd),
+                            ],
+                        },
+                    }
+                },
+                indent=2,
+            )
+        )
+    return mf
+
+
+def _run_claude_task(base: Path, prompt: str) -> None:
+    import shutil
+    import subprocess
+
+    if not shutil.which("claude"):
+        sys.exit("Error: 'claude' CLI required")
+    subprocess.run(
+        [
+            "claude",
+            "--model",
+            _C["server"]["model"],
+            "--mcp-config",
+            str(_ensure_mcp_json(base)),
+            "--agents",
+            _build_apps_json(base),
+            "--dangerously-skip-permissions",
+            "-p",
+            prompt,
+        ],
+        cwd=str(base),
+    )
+
+
+_app = typer.Typer(name="c3-py", help="c3 — WhatsApp AI agent framework", add_completion=False)
+
 
 @_app.command("auth")
-def _cli_auth(sessions_dir: str = typer.Option("sessions", "--sessions-dir", "-s")):
-    """Authenticate WhatsApp (scan QR code)."""; _cmd_auth(Path(sessions_dir))
+def _cli_auth(sessions_dir: str = typer.Option(DIR_SESSIONS, "--sessions-dir", "-s")):
+    """Authenticate WhatsApp — scan QR code."""
+    _cmd_auth(Path(sessions_dir))
 
-@_app.command("wa-login")
-def _cli_wa_login():
-    """WhatsApp login — scan QR code (Docker shortcut)."""; _cmd_auth(Path("/plugin/sessions"))
 
 @_app.command("check")
-def _cli_check(plugin_dir: str = typer.Option(".", "--plugin-dir", "-d")):
-    """Validate plugin directory."""; _cmd_check(Path(plugin_dir))
+def _cli_check(agent_dir: str = typer.Option(".", "--agent-dir", "-d")):
+    """Check prerequisites and validate app directory."""
+    issues = _check_prereqs()
+    [print(f"  ❌ {i}", file=sys.stderr) for i in issues] if issues else print(
+        "  ✅ Prerequisites OK"
+    )
+    base = Path(agent_dir)
+    for f, msg in _C["check_files"]:
+        if not (base / f).exists():
+            print(f"WARN  {f} missing — {msg}", file=sys.stderr)
+    g = list((base / DIR_SKILLS).glob("*.md")) if (base / DIR_SKILLS).exists() else []
+    if g:
+        print(f"skills/: {len(g)} skill(s): {', '.join(x.stem for x in g)}")
+    print("OK — app dir looks good")
 
-@_app.command("init")
-def _cli_init(plugin_dir: str = typer.Option(".", "--plugin-dir", "-d"), name: str = typer.Option("my-plugin", "--name", "-n")):
-    """Scaffold a new plugin directory."""; _cmd_init(Path(plugin_dir), name)
 
-_plugin_app = typer.Typer(help="Plugin management commands.")
-_app.add_typer(_plugin_app, name="plugin")
+_app_sub = typer.Typer(help="App management.")
+_app.add_typer(_app_sub, name="app")
 
-@_plugin_app.command("install")
-def _cli_plugin_install(
-    url: str = typer.Argument(..., help="GitHub URL or shorthand (user/repo)"),
-    plugin_dir: str = typer.Option(".", "--plugin-dir", "-d"),
+
+@_app_sub.command("new")
+def _cli_app_new(
+    name: str = typer.Argument(..., help="App name"),
+    description: str = typer.Argument("", help="What the app does (Claude generates everything)"),
+    agent_dir: str = typer.Option(".", "--agent-dir", "-d"),
 ):
-    """Install a plugin from a GitHub URL."""
-    import subprocess, tempfile
+    """Create a new app. Claude generates CLAUDE.md, app.json, and skills."""
+    base = Path(agent_dir)
+    dest = base / name
+    if dest.exists():
+        sys.exit(f"Error: app '{name}' already exists at {dest}")
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / DIR_SKILLS).mkdir(exist_ok=True)
+    _ensure_safe_app_json(dest, name, description)
+    if description:
+        _run_claude_task(base, _C["prompts"]["app_new"].format(name=name, description=description))
+    else:
+        _scaffold_app(dest)
+        print(f'\n  Tip: c3-py app new {name} "description" to have Claude generate everything')
+
+
+@_app_sub.command("list")
+def _cli_app_list(agent_dir: str = typer.Option(".", "--agent-dir", "-d")):
+    """List installed apps."""
+    base = Path(agent_dir)
+    bundled = _PKG / DIR_APPS
+    seen = {
+        d.name: ("bundled" if root == bundled else "local")
+        for root in [bundled, base]
+        if root.exists()
+        for d in sorted(root.iterdir())
+        if d.is_dir() and not d.name.startswith(".") and (d / FILE_CLAUDE_MD).exists()
+    }
+    if not seen:
+        print("No apps found.")
+        return
+    for name, src in sorted(seen.items()):
+        desc = _read_json(
+            next(
+                (
+                    x
+                    for x in [base / name / FILE_APP_JSON, bundled / name / FILE_APP_JSON]
+                    if x.exists()
+                ),
+                base / name / FILE_APP_JSON,
+            )
+        ).get("description", "")
+        print(f"  {name:20s} [{src}]  {desc}")
+
+
+def _stage_and_review(base, app_name, content_type, source, content=None):
+    dest = base / app_name
+    P = _C["prompts"]
+    R = _C["rules"]
+    if content and content_type == "skill":
+        (dest / DIR_SKILLS).mkdir(exist_ok=True)
+        sn = Path(source).stem if Path(source).suffix == ".md" else app_name
+        (dest / DIR_SKILLS / f"{sn}.md").write_text(content)
+        _run_claude_task(base, P["review_skill"].format(app=app_name, file=f"{sn}.md", rules=R))
+    elif content:
+        (dest / FILE_CLAUDE_MD).write_text(content)
+        _run_claude_task(base, P["review_prompt"].format(app=app_name, rules=R))
+    elif content_type == "skill":
+        _run_claude_task(base, P["gen_skill"].format(app=app_name, source=source, rules=R))
+    else:
+        _run_claude_task(base, P["gen_prompt"].format(app=app_name, source=source, rules=R))
+
+
+@_app_sub.command("add")
+def _cli_app_add(
+    app_name: str = typer.Argument(..., help="Target app name"),
+    content_type: str = typer.Argument(
+        ..., help="What to add: skill, mcp, prompt, or a GitHub URL"
+    ),
+    source: str = typer.Argument("", help="URL, file path, description, or inline content"),
+    agent_dir: str = typer.Option(".", "--agent-dir", "-d"),
+):
+    """Add content to an app."""
+    base = Path(agent_dir)
+    if content_type.startswith("http") or ("/" in content_type and not source):
+        _cli_app_install_from_url(base, app_name, content_type)
+        return
+    dest = base / app_name
+    dest.mkdir(parents=True, exist_ok=True)
+    _ensure_safe_app_json(dest, app_name)
+    if content_type == "mcp":
+        if not source:
+            sys.exit("Error: MCP config required")
+        try:
+            entry = json.loads(_fetch_content(source))
+        except Exception as e:
+            sys.exit(f"Error: {e}")
+        mf = dest / "mcp.json"
+        ex = _read_json(mf)
+        sn = entry.get("name", Path(entry.get("command", "mcp")).stem)
+        ex.setdefault("mcpServers", {})[sn] = entry
+        mf.write_text(json.dumps(ex, indent=2))
+        _run_claude_task(base, _C["prompts"]["mcp_added"].format(server=sn, app=app_name))
+    elif content_type in ("skill", "prompt"):
+        _stage_and_review(
+            base,
+            app_name,
+            content_type,
+            source,
+            _fetch_content(source) if Path(source).exists() or source.startswith("http") else None,
+        )
+    else:
+        sys.exit("Error: use skill, mcp, prompt, or a URL")
+
+
+def _cli_app_install_from_url(base: Path, name: str, url: str) -> None:
+    import shutil
+    import subprocess
+    import tempfile
+
     if "/" in url and not url.startswith("http"):
         url = f"https://github.com/{url}"
-    name = url.rstrip("/").split("/")[-1].removeprefix("c3-").removeprefix("c3py-")
-    dest = Path(plugin_dir) / name
-    if dest.exists(): sys.exit(f"Error: plugin '{name}' already exists at {dest}")
-    print(f"Installing {name} from {url}...")
+    dest = base / name
+    if dest.exists():
+        sys.exit(f"Error: '{name}' already exists")
     with tempfile.TemporaryDirectory() as tmp:
-        if subprocess.run(["git", "clone", "--depth", "1", url, tmp], capture_output=True).returncode != 0:
-            sys.exit(f"Error: could not clone {url}")
-        # Look for plugin structure: CLAUDE.md + skills/ or plugin.json
+        if (
+            subprocess.run(
+                ["git", "clone", "--depth", "1", url, tmp], capture_output=True
+            ).returncode
+            != 0
+        ):
+            sys.exit("Error: clone failed")
         src = Path(tmp)
-        if (src / "CLAUDE.md").exists(): src_dir = src
-        elif (src / name).is_dir() and (src / name / "CLAUDE.md").exists(): src_dir = src / name
-        else:
-            candidates = [d for d in src.iterdir() if d.is_dir() and (d / "CLAUDE.md").exists()]
-            src_dir = candidates[0] if candidates else src
-        import shutil; shutil.copytree(str(src_dir), str(dest), dirs_exist_ok=True)
-    # Clean up git artifacts
+        src_dir = next(
+            (
+                d
+                for d in [src, src / name, *(d for d in src.iterdir() if d.is_dir())]
+                if (d / FILE_CLAUDE_MD).exists()
+            ),
+            src,
+        )
+        shutil.copytree(str(src_dir), str(dest), dirs_exist_ok=True)
     for g in [dest / ".git", dest / ".github"]:
-        if g.exists(): import shutil; shutil.rmtree(g)
-    print(f"✅ Plugin '{name}' installed at {dest}")
-    if (dest / "CLAUDE.md").exists(): print(f"   CLAUDE.md found ✓")
-    if (dest / "skills").is_dir(): print(f"   skills/: {len(list((dest / 'skills').glob('*.md')))} skill(s)")
-    if (dest / "plugin.json").exists(): print(f"   plugin.json found ✓")
+        if g.exists():
+            shutil.rmtree(g)
+    mf = _read_json(dest / FILE_APP_JSON)
+    if mf:
+        mf.update(trust_level=TRUST_COMMUNITY, sandboxed=True)
+        if "allowed_tools" in mf:
+            mf["allowed_tools"] = [
+                t for t in mf["allowed_tools"] if t not in {"save_file", "load_app"}
+            ]
+        (dest / FILE_APP_JSON).write_text(json.dumps(mf, indent=2))
+    _ensure_safe_app_json(dest, name)
+    print(f"✅ Installed '{name}'")
 
-@_plugin_app.command("new")
-def _cli_plugin_new(
-    name: str = typer.Argument(..., help="Plugin name"),
-    plugin_dir: str = typer.Option(".", "--plugin-dir", "-d"),
+
+@_app_sub.command("install")
+def _cli_app_install(
+    url: str = typer.Argument(..., help="GitHub URL or shorthand (user/repo)"),
+    agent_dir: str = typer.Option(".", "--agent-dir", "-d"),
 ):
-    """Create a new plugin scaffold."""
-    _cmd_plugin_new(Path(plugin_dir) / name)
+    """Install a full app from GitHub. Shorthand for: app add <name> <url>"""
+    name = url.rstrip("/").split("/")[-1].removeprefix("c3-").removeprefix("c3py-")
+    _cli_app_install_from_url(Path(agent_dir), name, url)
+
 
 @_app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
-    plugin: Optional[str] = typer.Argument(None, help="Plugin name or path (e.g. 'games')"),
-    yes: bool = typer.Option(False, "-y", "--yes", help="Skip Claude permission prompts"),
-    serve: bool = typer.Option(False, "--serve", help="Run as MCP server (called by Claude Code)"),
-    plugin_dir: Optional[str] = typer.Option(None, "--plugin-dir", "-d"),
+    agent: Optional[str] = typer.Argument(None, help="App directory or name"),
+    serve: bool = typer.Option(False, "--serve"),
+    agent_dir: Optional[str] = typer.Option(None, "--agent-dir", "-d"),
     sessions_dir: Optional[str] = typer.Option(None, "--sessions-dir", "-s"),
-    sse: bool = typer.Option(False, "--sse", help="SSE transport (Docker)"),
-    sse_url: Optional[str] = typer.Option(None, "--sse-url", help="Connect to remote MCP server (e.g. http://localhost:3000/sse)"),
+    sse: bool = typer.Option(False, "--sse"),
+    sse_url: Optional[str] = typer.Option(None, "--sse-url"),
+    test: bool = typer.Option(False, "--test", help="Use test adapter instead of WhatsApp"),
     host: str = typer.Option(_cfg.host, "--host"),
     port: int = typer.Option(_cfg.port, "--port"),
 ) -> None:
-    if ctx.invoked_subcommand: return
-    if plugin == "wa-login": _cmd_auth(Path(sessions_dir or "/plugin/sessions")); return
-    pdir: str | None = plugin_dir
-    if plugin and not serve:
-        p = Path(plugin)
-        if p.exists(): pdir = str(p.resolve())
-        else:
-            pdir = _find_plugin_dir(plugin)
-            if not pdir:
-                typer.echo(f"Error: plugin '{plugin}' not found.\nTry: pip install c3-{plugin}", err=True)
-                raise typer.Exit(1)
-        _launcher_mode(pdir, yes, sse_url=sse_url); return
-    if pdir is None: pdir = "."
+    if ctx.invoked_subcommand:
+        return
+    adir = agent_dir
+    if agent and not serve:
+        p = Path(agent)
+        adir = str(p.resolve()) if p.exists() else _find_app_dir(agent)
+        if not adir:
+            typer.echo(f"Error: app '{agent}' not found", err=True)
+            raise typer.Exit(1)
+        _launcher_mode(adir, False, sse_url=sse_url)
+        return
+    adir = adir or "."
     sdir = sessions_dir
-    if sdir is None:
-        candidate = Path(pdir) / "sessions"
-        if candidate.exists(): sdir = str(candidate)
-    asyncio.run(create_channel(BaileysAdapter(sessions_dir=sdir), plugin_dir=pdir,
-        transport="sse" if sse else "stdio", host=host, port=port))
+    if not sdir and (Path(adir) / DIR_SESSIONS).exists():
+        sdir = str(Path(adir) / DIR_SESSIONS)
+    if test:
+        from c3.test_adapter import TestAdapter
 
-def cli() -> None: _app()
+        wa: ChatAdapter = TestAdapter()
+    else:
+        wa = BaileysAdapter(sessions_dir=sdir)
+    asyncio.run(
+        create_channel(
+            wa, agent_dir=adir, transport="sse" if sse else "stdio", host=host, port=port
+        )
+    )
+
+
+def cli() -> None:
+    _app()
+
 
 if __name__ == "__main__":
     cli()

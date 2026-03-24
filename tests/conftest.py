@@ -6,8 +6,8 @@ from c3.agent import (
     ChannelCore,
     GroupMember,
     HostConfig,
-    PluginController,
-    PluginManifest,
+    AccessControl,
+    AppManifest,
     SessionEngine,
     WAAdapter,
 )
@@ -44,6 +44,15 @@ class FakeWAAdapter(WAAdapter):
     def get_name(self, jid: str) -> str:
         return jid.split("@")[0]
 
+    def is_valid_invite(self, link: str) -> bool:
+        return "chat.whatsapp.com" in link
+
+    def is_group_id(self, id: str) -> bool:
+        return id.endswith("@g.us")
+
+    def extract_name(self, id: str) -> str:
+        return id.split("@")[0]
+
 
 @pytest.fixture
 def fake_wa() -> FakeWAAdapter:
@@ -58,19 +67,19 @@ def app_config(host_jid) -> AppConfig:
     return AppConfig(hosts=[HostConfig(jid=host_jid, name="Host")])
 
 @pytest.fixture
-def manifest() -> PluginManifest:
-    return PluginManifest(
+def manifest() -> AppManifest:
+    return AppManifest(
         name="test",
         access=AccessPolicy(
-            commands={"/start": ["hosts", "admins"], "/stop": ["hosts", "admins"]},
-            dm=["hosts", "admins"],
-            group=[],
+            commands={"/start": ["hosts"], "/stop": ["hosts"]},
+            dm=["hosts"],
+            group=["session_participants"],
         ),
     )
 
 @pytest.fixture
-def ctrl(manifest, app_config) -> PluginController:
-    return PluginController(manifest, app_config)
+def ctrl(manifest, app_config) -> AccessControl:
+    return AccessControl(manifest, app_config)
 
 @pytest.fixture
 def notified() -> list:
@@ -88,5 +97,6 @@ def engine(fake_wa, notify_fn, ctrl) -> SessionEngine:
 
 @pytest.fixture
 def core(fake_wa, ctrl, engine, notify_fn, tmp_path) -> ChannelCore:
-    session = ctrl.create_session()
-    return ChannelCore(fake_wa, ctrl, session, engine, notify_fn, tmp_path)
+    return ChannelCore(fake_wa, ctrl, engine, notify_fn, tmp_path)
+
+FakeAdapter = FakeWAAdapter

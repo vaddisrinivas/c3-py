@@ -2,20 +2,20 @@
 set -e
 
 export BROWSER=false
+DATA_DIR="${C3_DATA_DIR:-/data}"
 
-# ── Pre-configure Claude Code (all dialogs, all flags) ────────────────────────
+# ── Pre-configure Claude Code ─────────────────────────────────────────────────
 python3 -c "
-import json, pathlib
+import json, pathlib, os
 
+data_dir = os.environ.get('C3_DATA_DIR', '/data')
 p = pathlib.Path('/home/c3/.claude.json')
 cfg = json.loads(p.read_text()) if p.exists() else {}
 
-# Skip onboarding, theme picker
 cfg['theme'] = 'dark'
 cfg['hasCompletedOnboarding'] = True
 
-# Trust /plugin workspace + approve all MCP servers
-proj = cfg.setdefault('projects', {}).setdefault('/plugin', {})
+proj = cfg.setdefault('projects', {}).setdefault(data_dir, {})
 proj['hasTrustDialogAccepted'] = True
 proj['hasCompletedProjectOnboarding'] = True
 proj['allowAllMcpjsonServers'] = True
@@ -23,12 +23,11 @@ proj.setdefault('enabledMcpjsonServers', [])
 if 'whatsapp' not in proj['enabledMcpjsonServers']:
     proj['enabledMcpjsonServers'].append('whatsapp')
 
-# Enable channels feature flag
 cfg.setdefault('cachedGrowthBookFeatures', {})
 cfg['cachedGrowthBookFeatures']['tengu_harbor'] = True
-
-# Accept bypass permissions + dev channels dialogs
 cfg['bypassPermissionsModeAccepted'] = True
+cfg['preferredNotebookModel'] = 'claude-3-5-haiku-latest'
+cfg['smallModelEnabled'] = True
 
 p.write_text(json.dumps(cfg, indent=2))
 "
@@ -49,7 +48,6 @@ else
     echo ""
     claude
     echo ""
-    # Verify it actually worked
     if ! claude auth status --json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('loggedIn') else 1)" 2>/dev/null; then
         echo "[c3] Auth failed. Container will restart — try again."
         exit 1
@@ -58,12 +56,10 @@ else
 fi
 
 # ── Step 2: WhatsApp auth ────────────────────────────────────────────────────
-# Check creds.json exists AND is non-empty (>10 bytes)
-if [ -f /plugin/sessions/creds.json ] && [ "$(wc -c < /plugin/sessions/creds.json)" -gt 10 ]; then
+if [ -f "$DATA_DIR/sessions/creds.json" ] && [ "$(wc -c < "$DATA_DIR/sessions/creds.json")" -gt 10 ]; then
     echo "[c3] ✅ WhatsApp authenticated"
 else
-    # Clean up any stale empty creds
-    rm -f /plugin/sessions/creds.json
+    rm -f "$DATA_DIR/sessions/creds.json"
 
     echo ""
     echo "┌──────────────────────────────────────────────────────┐"
@@ -75,41 +71,37 @@ else
     echo "│  QR refreshes every 20s. Wait for ✅                  │"
     echo "└──────────────────────────────────────────────────────┘"
     echo ""
-    mkdir -p /plugin/sessions
-    SESSIONS_DIR=/plugin/sessions node /app/c3/baileys_bridge.js &
+    mkdir -p "$DATA_DIR/sessions"
+    SESSIONS_DIR="$DATA_DIR/sessions" node /app/c3/baileys_bridge.js &
     BRIDGE_PID=$!
 
-    # Wait for creds.json to exist AND be non-empty
     echo "[c3] Waiting for QR scan..."
     while true; do
-        if [ -f /plugin/sessions/creds.json ] && [ "$(wc -c < /plugin/sessions/creds.json)" -gt 10 ]; then
+        if [ -f "$DATA_DIR/sessions/creds.json" ] && [ "$(wc -c < "$DATA_DIR/sessions/creds.json")" -gt 10 ]; then
             break
         fi
         sleep 2
     done
 
-    # Give baileys time to finish writing all keys
     echo "[c3] QR scanned, saving session..."
     sleep 10
 
     kill $BRIDGE_PID 2>/dev/null || true
     wait $BRIDGE_PID 2>/dev/null || true
 
-    # Auto-create config.json with bot's JID as host if no config exists
     python3 -c "
-import json, pathlib, re
-creds = pathlib.Path('/plugin/sessions/creds.json')
-cfg_path = pathlib.Path('/plugin/config.json')
+import json, pathlib, re, os
+data_dir = os.environ.get('C3_DATA_DIR', '/data')
+creds = pathlib.Path(f'{data_dir}/sessions/creds.json')
+cfg_path = pathlib.Path(f'{data_dir}/config.json')
 if creds.exists() and creds.stat().st_size > 10 and not cfg_path.exists():
     try:
         data = json.loads(creds.read_text())
         me = data.get('me', {}).get('id', '')
         if me:
-            # normalize 1234:56@s.whatsapp.net → 1234@s.whatsapp.net
             jid = re.sub(r':\d+@', '@', me)
             cfg_path.write_text(json.dumps({
-                'hosts': [{'jid': jid, 'name': 'Host'}],
-                'admins': []
+                'hosts': [{'jid': jid, 'name': 'Host'}]
             }, indent=2))
             print(f'[c3] Auto-created config.json with host JID: {jid}')
     except Exception as e:
@@ -129,4 +121,4 @@ echo "│  Press Enter to accept the dev channels warning.     │"
 echo "│  Then Ctrl+P Ctrl+Q to detach.                       │"
 echo "└──────────────────────────────────────────────────────┘"
 echo ""
-exec c3-py "${PLUGIN:-/plugin}" "$@"
+exec c3-py "$DATA_DIR" "$@"

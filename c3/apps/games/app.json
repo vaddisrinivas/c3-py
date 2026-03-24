@@ -1,0 +1,27 @@
+{
+  "$schema": "../app.schema.json",
+  "name": "games",
+  "description": "Multiplayer WhatsApp games — trivia, mafia, werewolf, and more",
+  "trust_level": "builtin",
+  "sandboxed": false,
+  "access": {
+    "commands": {
+      "/start":  ["hosts"],
+      "/stop":   ["hosts"],
+      "/status": ["hosts"],
+      "/app":    ["hosts"]
+    },
+    "dm":    ["hosts"],
+    "group": ["session_group"]
+  },
+  "memory_schema": {
+    "player": {
+      "fields": ["name", "score", "wins", "losses", "favorite_topic", "last_seen"]
+    },
+    "game_session": {
+      "fields": ["date", "game", "topic", "winner", "participants", "rounds", "duration_mins"]
+    }
+  },
+  "crons": [],
+  "allowed_tools": ["reply", "send_poll", "send_private", "set_timer", "get_group_members", "resolve_group", "memory_read", "memory_write", "memory_search", "memory_delete", "load_app", "react"]
+}

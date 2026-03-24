@@ -1,0 +1,19 @@
+{
+  "$schema": "../app.schema.json",
+  "name": "appedit",
+  "description": "Edit existing c3 apps — change access, tools, prompts, memory schema via WhatsApp",
+  "trust_level": "builtin",
+  "sandboxed": false,
+  "access": {
+    "commands": {
+      "/start": ["hosts"],
+      "/stop": ["hosts"],
+      "/app": ["hosts"]
+    },
+    "dm": ["hosts"],
+    "group": []
+  },
+  "memory_schema": {},
+  "crons": [],
+  "allowed_tools": ["reply", "send_poll", "save_file", "memory_read", "memory_write", "load_app"]
+}

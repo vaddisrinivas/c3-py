@@ -1,0 +1,18 @@
+services:
+  c3-test:
+    build: .
+    image: c3-py:test
+    container_name: c3-test
+    command: ["c3-py", "--serve", "--test", "--sse", "--port", "3000", "--agent-dir", "/data"]
+    ports:
+      - "3001:3000"
+    volumes:
+      - c3-test-data:/data
+      - claude-auth:/home/c3/.claude
+    environment:
+      - C3_DATA_DIR=/data
+    restart: "no"
+
+volumes:
+  c3-test-data:
+  claude-auth:
