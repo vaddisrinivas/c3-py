@@ -88,7 +88,7 @@ Or scaffold manually: `c3-py app new expense-tracker`
 
 ### Edit an app
 
-DM: "edit the mealprep app". The **appedit** app shows current config, lets you change access/tools/prompts via polls.
+DM: "edit the expenses app". The **appedit** app shows current config, lets you change access/tools/prompts via polls.
 
 ### Install from marketplace
 
@@ -103,11 +103,12 @@ c3-py app install user/repo
 
 | App | What it does |
 |---|---|
-| `games` | 12 multiplayer WhatsApp games (Trivia, Mafia, Werewolf, etc.) |
-| `calendar` | Scheduling, reminders, events |
-| `mealprep` | Meal planning, grocery lists |
+| `games` | 9 multiplayer WhatsApp games (Trivia, 20 Questions, Poll Party, etc.) |
+| `events` | Event scheduling and RSVPs |
+| `expenses` | Group expense tracking |
 | `appgen` | Create new apps via WhatsApp polls |
 | `appedit` | Edit existing apps via WhatsApp polls |
+| `appstore` | Browse and install community apps |
 
 ---
 
@@ -252,7 +253,7 @@ Rebuild to update: `docker compose up -d --build`
 
 ```bash
 uv sync --all-extras
-uv run pytest         # 120 tests
+uv run pytest         # 361 tests
 uvx ruff check c3/
 ```
 
